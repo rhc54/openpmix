@@ -17,31 +17,31 @@
 
 # -- Project information -----------------------------------------------------
 
-project = 'Open MPI'
-copyright = '2021, The Open MPI Community'
-author = 'The Open MPI Community'
+project = 'OpenPMIx'
+copyright = '2021, The OpenPMIx Community'
+author = 'The OpenPMIx Community'
 
 # The full version, including alpha/beta/rc tags
-# Read the Open MPI version from the VERSION file
+# Read the OpenPMIx version from the VERSION file
 with open("../VERSION") as fp:
-    ompi_lines = fp.readlines()
+    pmix_lines = fp.readlines()
 
-ompi_data = dict()
-for ompi_line in ompi_lines:
-    if '#' in ompi_line:
-        ompi_line, _ = ompi_line.split("#")
-    ompi_line = ompi_line.strip()
+pmix_data = dict()
+for pmix_line in pmix_lines:
+    if '#' in pmix_line:
+        pmix_line, _ = pmix_line.split("#")
+    pmix_line = pmix_line.strip()
 
-    if '=' not in ompi_line:
+    if '=' not in pmix_line:
         continue
 
-    ompi_key, ompi_val = ompi_line.split("=")
-    ompi_data[ompi_key.strip()] = ompi_val.strip()
+    pmix_key, pmix_val = pmix_line.split("=")
+    pmix_data[pmix_key.strip()] = pmix_val.strip()
 
 # Release is a sphinx config variable -- assign it to the computed
-# Open MPI version number.
-series = f"{ompi_data['major']}.{ompi_data['minor']}.x"
-release = f"{ompi_data['major']}.{ompi_data['minor']}.{ompi_data['release']}{ompi_data['greek']}"
+# PMIx version number.
+series = f"{pmix_data['major']}.{pmix_data['minor']}.x"
+release = f"{pmix_data['major']}.{pmix_data['minor']}.{pmix_data['release']}{pmix_data['greek']}"
 
 
 # -- General configuration ---------------------------------------------------
@@ -74,7 +74,7 @@ html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
 
 
-# -- Open MPI-specific options -----------------------------------------------
+# -- PMIx-specific options -----------------------------------------------
 
 # This prolog is included in every file.  Put common stuff here.
 
@@ -82,6 +82,6 @@ rst_prolog = f"""
 .. |mdash|  unicode:: U+02014 .. Em dash
 .. |rarrow| unicode:: U+02192 .. Right arrow
 
-.. |ompi_ver| replace:: {release}
-.. |ompi_series| replace:: {series}
+.. |pmix_ver| replace:: {release}
+.. |pmix_series| replace:: {series}
 """
