@@ -672,7 +672,44 @@ static void fence_timeout(int sd, short args, void *cbdata)
     PMIX_RELEASE(trk);
 }
 
+static void get_key(pmix_proc_t *pcs,
+                    char ***kmap,
+                    pmix_value_array_t *key_count_array,
+                    uint32_t *key_count)
+{
+    pmix_cb_t cb;
+    pmix_kval_t *kv;
+    pmix_status_t rc;
+    int key_idx;
+    char **kmap = NULL;
+
+    PMIX_CONSTRUCT(&cb, pmix_cb_t);
+    cb.proc = &pcs;
+    cb.scope = PMIX_REMOTE;
+    cb.copy = true;
+    PMIX_GDS_FETCH_KV(rc, pmix_globals.mypeer, &cb);
+    if (PMIX_SUCCESS == rc) {
+        PMIX_LIST_FOREACH (kv, &cb.kvs, pmix_kval_t) {
+            rc = pmix_argv_append_unique_idx(&key_idx, kmap, kv->key);
+            if (pmix_value_array_get_size(key_count_array) < (size_t)(key_idx + 1)) {
+                size_t new_size;
+                size_t old_size = pmix_value_array_get_size(key_count_array);
+
+                pmix_value_array_set_size(key_count_array, key_idx + 1);
+                new_size = pmix_value_array_get_size(key_count_array);
+                key_count = PMIX_VALUE_ARRAY_GET_BASE(key_count_array, uint32_t);
+                memset(key_count + old_size, 0,
+                       sizeof(uint32_t) * (new_size - old_size));
+            }
+            key_count = PMIX_VALUE_ARRAY_GET_BASE(key_count_array, uint32_t);
+            key_count[key_idx]++;
+        }
+    }
+    PMIX_DESTRUCT(&cb);
+}
+
 pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
+                                       pmix_proc_t *procs, size_t nprocs,
                                        pmix_buffer_t *buf)
 {
     pmix_buffer_t bucket, *pbkt = NULL;
@@ -688,11 +725,14 @@ pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
     pmix_list_t rank_blobs;
     rank_blob_t *blob;
     uint32_t kmap_size;
-    int key_idx;
+    size_t sz;
+    size_t key_fmt_size[PMIX_MODEX_KEY_MAX] = {0};
+    pmix_value_array_t key_count_array = PMIX_VALUE_ARRAY_STATIC_INIT;
+    uint32_t *key_count = NULL;
+    char **kmap = NULL;
 
     /* key names map, the position of the key name
      * in the array determines the unique key index */
-    char **kmap = NULL;
     int i;
     pmix_gds_modex_blob_info_t blob_info_byte = 0;
     pmix_gds_modex_key_fmt_t kmap_type = PMIX_MODEX_KEY_INVALID;
@@ -709,38 +749,22 @@ pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
          *   from idx: key names stored as indexes (avoid key duplication)
          * - regular: key-names stored as is */
         if (PMIX_MODEX_KEY_INVALID == kmap_type) {
-            size_t key_fmt_size[PMIX_MODEX_KEY_MAX] = {0};
-            pmix_value_array_t *key_count_array = PMIX_NEW(pmix_value_array_t);
-            uint32_t *key_count = NULL;
+            PMIX_CONSTRUCT(&key_count_array, pmix_value_array_t);
+            pmix_value_array_init(&key_count_array, sizeof(uint32_t));
 
-            pmix_value_array_init(key_count_array, sizeof(uint32_t));
-
-            PMIX_LIST_FOREACH (scd, &trk->local_cbs, pmix_server_caddy_t) {
-                pmix_strncpy(pcs.nspace, scd->peer->info->pname.nspace, PMIX_MAX_NSLEN);
-                pcs.rank = scd->peer->info->pname.rank;
-                PMIX_CONSTRUCT(&cb, pmix_cb_t);
-                cb.proc = &pcs;
-                cb.scope = PMIX_REMOTE;
-                cb.copy = true;
-                PMIX_GDS_FETCH_KV(rc, pmix_globals.mypeer, &cb);
-                if (PMIX_SUCCESS == rc) {
-                    PMIX_LIST_FOREACH (kv, &cb.kvs, pmix_kval_t) {
-                        rc = pmix_argv_append_unique_idx(&key_idx, &kmap, kv->key);
-                        if (pmix_value_array_get_size(key_count_array) < (size_t)(key_idx + 1)) {
-                            size_t new_size;
-                            size_t old_size = pmix_value_array_get_size(key_count_array);
-
-                            pmix_value_array_set_size(key_count_array, key_idx + 1);
-                            new_size = pmix_value_array_get_size(key_count_array);
-                            key_count = PMIX_VALUE_ARRAY_GET_BASE(key_count_array, uint32_t);
-                            memset(key_count + old_size, 0,
-                                   sizeof(uint32_t) * (new_size - old_size));
-                        }
-                        key_count = PMIX_VALUE_ARRAY_GET_BASE(key_count_array, uint32_t);
-                        key_count[key_idx]++;
-                    }
+            if (NULL == procs) {
+                PMIX_LIST_FOREACH (scd, &trk->local_cbs, pmix_server_caddy_t) {
+                    PMIX_LOAD_PROCID(&pcs, scd->peer->info->pname.nspace, scd->peer->info->pname.rank);
+                    get_key(&pcs, &kmap, &key_count_array, key_count);
                 }
-                PMIX_DESTRUCT(&cb);
+                // point to the tracker's namespace list
+                nslist = &trk->nslist;
+            } else {
+                for (sz=0; sz < nprocs; sz++) {
+                    get_key(&procs[sz], &kmap, &key_count_array, key_count);
+                }
+                // need to create a list of namespaces
+
             }
             for (i = 0; i < PMIx_Argv_count(kmap); i++) {
                 pmix_buffer_t tmp;
@@ -760,7 +784,7 @@ pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
                 key_fmt_size[PMIX_MODEX_KEY_NATIVE_FMT] = kname_size * key_count[i];
                 key_fmt_size[PMIX_MODEX_KEY_KEYMAP_FMT] = kname_size + key_count[i] * kidx_size;
             }
-            PMIX_RELEASE(key_count_array);
+            PMIX_DESTRUCT(&key_count_array);
 
             /* select the most efficient key-name pack format */
             kmap_type = key_fmt_size[PMIX_MODEX_KEY_NATIVE_FMT]
@@ -771,11 +795,11 @@ pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
                                 kmap_type == PMIX_MODEX_KEY_KEYMAP_FMT ? "kmap" : "native");
         }
         PMIX_CONSTRUCT(&rank_blobs, pmix_list_t);
+        if (NULL == procs) {
         PMIX_LIST_FOREACH (scd, &trk->local_cbs, pmix_server_caddy_t) {
             /* get any remote contribution - note that there
              * may not be a contribution */
-            pmix_strncpy(pcs.nspace, scd->peer->info->pname.nspace, PMIX_MAX_NSLEN);
-            pcs.rank = scd->peer->info->pname.rank;
+            PMIX_LOAD_PROCID(&pcs, scd->peer->info->pname.nspace, scd->peer->info->pname.rank);
             pbkt = PMIX_NEW(pmix_buffer_t);
             /* calculate the throughout rank */
             rel_rank = 0;

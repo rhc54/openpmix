@@ -3464,9 +3464,8 @@ static void _mdxcbfunc(int sd, short args, void *cbdata)
         goto finish_collective;
     }
 
-    /* Collect the nptr list with uniq GDS components of all local
-     * participants. It does not allow multiple storing to the
-     * same GDS if participants have mutual GDS. */
+    /* Collect the list of unique nspaces so we store the
+     * data so each namespace can access it */
     PMIX_LIST_FOREACH (cd, &tracker->local_cbs, pmix_server_caddy_t) {
         // see if we already have this nspace
         found = false;
