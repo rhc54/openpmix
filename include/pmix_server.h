@@ -4,7 +4,7 @@
  *                         All rights reserved.
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Redistribution and use in source and binary forms, with or without
@@ -894,6 +894,11 @@ PMIX_EXPORT pmix_status_t PMIx_server_register_resources(pmix_info_t info[], siz
 PMIX_EXPORT pmix_status_t PMIx_server_deregister_resources(pmix_info_t info[], size_t ninfo,
                                                            pmix_op_cbfunc_t cbfunc,
                                                            void *cbdata);
+
+/* collect modex data for procs */
+PMIX_EXPORT pmix_status_t PMIx_server_collect_proc_data(pmix_proc_t *procs, size_t nprocs,
+                                                        pmix_data_buffer_t *buf);
+
 
 #if defined(c_plusplus) || defined(__cplusplus)
 }
