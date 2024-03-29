@@ -77,8 +77,11 @@ int main(int argc, char **argv)
     pmix_info_t *results = NULL, info[3];
     size_t nresults, cid, n, m, psize;
     pmix_data_array_t dry;
+    char hostname[1024];
 
     EXAMPLES_HIDE_UNUSED_PARAMS(argc, argv);
+
+    gethostname(hostname, 1024);
 
     /* init us */
     if (PMIX_SUCCESS != (rc = PMIx_Init(&myproc, NULL, 0))) {
@@ -86,7 +89,7 @@ int main(int argc, char **argv)
                 PMIx_Error_string(rc));
         exit(0);
     }
-    fprintf(stderr, "Client ns %s rank %d: Running\n", myproc.nspace, myproc.rank);
+    fprintf(stderr, "Client ns %s rank %d: Running on host %s\n", myproc.nspace, myproc.rank, hostname);
 
     PMIX_PROC_CONSTRUCT(&proc);
     PMIX_LOAD_PROCID(&proc, myproc.nspace, PMIX_RANK_WILDCARD);

@@ -913,9 +913,156 @@ static pmix_status_t pack_result(pmix_collect_t collect_type,
     return PMIX_SUCCESS;
 }
 
-pmix_status_t PMIx_server_collect_proc_data(pmix_proc_t *procs, size_t nprocs,
-                                            pmix_data_buffer_t *dbuf)
+static void _collect_job_info(int sd, short args, void *cbdata)
 {
+    pmix_cb_t *cbin = (pmix_cb_t*)cbdata;
+    char **nspaces = NULL;
+    size_t n, m;
+    bool found;
+    pmix_proc_t proc;
+    pmix_cb_t cb;
+    pmix_status_t ret;
+    pmix_buffer_t pbkt;
+    pmix_kval_t *kptr;
+    pmix_byte_object_t pbo;
+    pmix_namespace_t *nptr, *ns;
+    pmix_rank_info_t *rinfo;
+    pmix_peer_t *peer;
+    PMIX_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cbin);
+
+    /* find the unique nspaces that are participating */
+    for (m=0; m < cbin->nprocs; m++) {
+        if (NULL == nspaces) {
+            PMIx_Argv_append_nosize(&nspaces, cbin->procs[m].nspace);
+        } else {
+            found = false;
+            for (n = 0; NULL != nspaces[n]; n++) {
+                if (0 == strcmp(nspaces[n], cbin->procs[m].nspace)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                PMIx_Argv_append_nosize(&nspaces, cbin->procs[m].nspace);
+            }
+        }
+    }
+
+    // cycle across the nspaces to collect their job info
+    for (n = 0; NULL != nspaces[n]; n++) {
+        // see if we have this nspace
+        nptr = NULL;
+        PMIX_LIST_FOREACH (ns, &pmix_globals.nspaces, pmix_namespace_t) {
+            if (0 == strcmp(ns->nspace, nspaces[n])) {
+                nptr = ns;
+                break;
+            }
+        }
+        if (NULL == nptr) {
+            // we don't know this one, so nothing we can do
+            continue;
+        }
+        /* this is a local request, so give the gds the option
+         * of returning a copy of the data, or a pointer to
+         * local storage */
+        PMIX_LOAD_PROCID(&proc, nspaces[n], PMIX_RANK_WILDCARD);
+        PMIX_CONSTRUCT(&cb, pmix_cb_t);
+        cb.proc = &proc;
+        cb.scope = PMIX_SCOPE_UNDEF;
+        cb.copy = false;
+
+        ret = PMIX_ERR_NOT_FOUND;
+        // have any local clients registered?
+        if (0 < pmix_list_get_size(&nptr->ranks)) {
+            // get one of the local clients so we will
+            // know its gds module
+            rinfo = (pmix_rank_info_t*)pmix_list_get_first(&nptr->ranks);
+            if (NULL != rinfo) {
+                peer = (pmix_peer_t*)pmix_pointer_array_get_item(&pmix_server_globals.clients, rinfo->peerid);
+                if (NULL != peer) {
+                    PMIX_GDS_FETCH_KV(ret, peer, &cb);
+                }
+            }
+        }
+        // if we didn't find it there, try getting it
+        // from our storage
+        if (PMIX_SUCCESS != ret) {
+            PMIX_GDS_FETCH_KV(ret, pmix_globals.mypeer, &cb);
+            if (PMIX_SUCCESS != ret) {
+                PMIX_ERROR_LOG(ret);
+                PMIX_DESTRUCT(&cb);
+                continue;
+            }
+        }
+
+        PMIX_CONSTRUCT(&pbkt, pmix_buffer_t);
+        /* pack the nspace name */
+        PMIX_BFROPS_PACK(ret, pmix_globals.mypeer, &pbkt, &nspaces[n], 1, PMIX_STRING);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            PMIX_DESTRUCT(&pbkt);
+            PMIX_DESTRUCT(&cb);
+            goto done;
+        }
+        PMIX_LIST_FOREACH (kptr, &cb.kvs, pmix_kval_t) {
+            PMIX_BFROPS_PACK(ret, pmix_globals.mypeer, &pbkt, kptr, 1, PMIX_KVAL);
+            if (PMIX_SUCCESS != ret) {
+                PMIX_ERROR_LOG(ret);
+                PMIX_DESTRUCT(&pbkt);
+                PMIX_DESTRUCT(&cb);
+                goto done;
+            }
+        }
+        PMIX_DESTRUCT(&cb);
+
+
+        PMIX_UNLOAD_BUFFER(&pbkt, pbo.bytes, pbo.size);
+        PMIX_BFROPS_PACK(ret, pmix_globals.mypeer, &cb.data, &pbo, 1, PMIX_BYTE_OBJECT);
+        PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            PMIX_DESTRUCT(&pbkt);
+            goto done;
+        }
+
+        PMIX_DESTRUCT(&pbkt);
+    }
+
+done:
+    PMIx_Argv_free(nspaces);
+    PMIX_WAKEUP_THREAD(&cbin->lock);
+    PMIX_POST_OBJECT(cb);
+}
+
+pmix_status_t PMIx_server_collect_job_info(pmix_proc_t *procs, size_t nprocs,
+                                           pmix_data_buffer_t *dbuf)
+{
+    pmix_cb_t cb;
+    pmix_byte_object_t bo;
+    pmix_status_t rc;
+
+    // we need to threadshift this request as it accesses
+    // global data
+    PMIX_CONSTRUCT(&cb, pmix_cb_t);
+    cb.procs = procs;
+    cb.nprocs = nprocs;
+    PMIX_THREADSHIFT(&cb, _collect_job_info);
+    PMIX_WAIT_THREAD(&cb.lock);
+
+    if (PMIX_SUCCESS == cb.status) {
+        PMIX_UNLOAD_BUFFER(&cb.data, bo.bytes, bo.size);
+        PMIx_Data_buffer_load(dbuf, bo.bytes, bo.size);  // removes data from the byte object
+    }
+    rc = cb.status;
+    PMIX_DESTRUCT(&cb);
+    return rc;
+}
+
+static void _collect_proc_data(int sd, short args, void *cbdata)
+{
+    pmix_cb_t *cb = (pmix_cb_t*)cbdata;
     pmix_value_array_t key_count_array = PMIX_VALUE_ARRAY_STATIC_INIT;
     uint32_t *key_count = NULL;
     char **kmap = NULL;
@@ -926,72 +1073,97 @@ pmix_status_t PMIx_server_collect_proc_data(pmix_proc_t *procs, size_t nprocs,
     pmix_list_t rank_blobs, nspaces;
     pmix_namespace_t *nm, *ns;
     pmix_buffer_t buf;
-    pmix_byte_object_t bo;
     pmix_status_t rc;
+    PMIX_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cb);
 
     PMIX_CONSTRUCT(&nspaces, pmix_list_t);
     PMIX_CONSTRUCT(&key_count_array, pmix_value_array_t);
     pmix_value_array_init(&key_count_array, sizeof(uint32_t));
 
-    for (sz=0; sz < nprocs; sz++) {
-        get_key(&procs[sz], &kmap, &key_count_array, key_count);
+    for (sz=0; sz < cb->nprocs; sz++) {
+        get_key(&cb->procs[sz], &kmap, &key_count_array, key_count);
         found = false;
         PMIX_LIST_FOREACH(ncd, &nspaces, pmix_nspace_caddy_t) {
-            if (PMIX_CHECK_NSPACE(ncd->ns->nspace, procs[sz].nspace)) {
+            if (PMIX_CHECK_NSPACE(ncd->ns->nspace, cb->procs[sz].nspace)) {
                 found = true;
                 break;
             }
         }
         if (!found) {
             // find the namespace in our global array - must be present
+            // or else it wasn't registered with us
             ns = NULL;
             PMIX_LIST_FOREACH(nm, &pmix_globals.nspaces, pmix_namespace_t) {
-                if (PMIX_CHECK_NSPACE(procs[sz].nspace, nm->nspace)) {
+                if (PMIX_CHECK_NSPACE(cb->procs[sz].nspace, nm->nspace)) {
                     ns = nm;
                     break;
                 }
             }
             if (NULL == ns) {
-                // should never happen
-                PMIX_DESTRUCT(&key_count_array);
-                PMIX_LIST_DESTRUCT(&nspaces);
-                return PMIX_ERR_NOT_FOUND;
+                // should never happen, but continue if it does
+                // as some hosts may not register all nspaces
+                continue;
             }
             ncd = PMIX_NEW(pmix_nspace_caddy_t);
+            PMIX_RETAIN(ns);
             ncd->ns = ns;
             pmix_list_append(&nspaces, &ncd->super);
         }
     }
     kmap_type = select_maptype(kmap, &key_count_array);
-    PMIX_DESTRUCT(&key_count_array);
 
     PMIX_CONSTRUCT(&rank_blobs, pmix_list_t);
-    for (sz=0; sz < nprocs; sz++) {
-        rc = get_remote_modex(&procs[sz], kmap_type, kmap, &nspaces, &rank_blobs);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_LIST_DESTRUCT(&rank_blobs);
-            PMIX_LIST_DESTRUCT(&nspaces);
-            PMIx_Argv_free(kmap);
-            return rc;
+    for (sz=0; sz < cb->nprocs; sz++) {
+        rc = get_remote_modex(&cb->procs[sz], kmap_type, kmap, &nspaces, &rank_blobs);
+        // it is okay if we don't find anything for this proc
+        // as it may not be local and/or the app may not have
+        // done a global fence that shared data
+        if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
+            cb->status = rc;
+            goto done;
         }
     }
-    PMIX_LIST_DESTRUCT(&nspaces);
 
     PMIX_CONSTRUCT(&buf, pmix_buffer_t);
     rc = pack_result(PMIX_COLLECT_YES, &buf, kmap, kmap_type, &rank_blobs);
     if (PMIX_SUCCESS != rc) {
-        PMIX_LIST_DESTRUCT(&rank_blobs);
-        PMIx_Argv_free(kmap);
-        PMIX_DESTRUCT(&buf);
-        return rc;
+        cb->status = rc;
     }
+
+done:
+    PMIX_DESTRUCT(&key_count_array);
+    PMIX_LIST_DESTRUCT(&nspaces);
     PMIX_LIST_DESTRUCT(&rank_blobs);
     PMIx_Argv_free(kmap);
 
-    PMIX_UNLOAD_BUFFER(&buf, bo.bytes, bo.size);
-    PMIX_DESTRUCT(&buf);
-    PMIx_Data_buffer_load(dbuf, bo.bytes, bo.size);  // removes data from the byte object
-    return PMIX_SUCCESS;
+    PMIX_WAKEUP_THREAD(&cb->lock);
+    PMIX_POST_OBJECT(cb);
+}
+
+pmix_status_t PMIx_server_collect_proc_data(pmix_proc_t *procs, size_t nprocs,
+                                            pmix_data_buffer_t *dbuf)
+{
+    pmix_cb_t cb;
+    pmix_byte_object_t bo;
+    pmix_status_t rc;
+
+    // we need to threadshift this request as it accesses
+    // global data
+    PMIX_CONSTRUCT(&cb, pmix_cb_t);
+    cb.procs = procs;
+    cb.nprocs = nprocs;
+    PMIX_THREADSHIFT(&cb, _collect_proc_data);
+    PMIX_WAIT_THREAD(&cb.lock);
+
+    if (PMIX_SUCCESS == cb.status) {
+        PMIX_UNLOAD_BUFFER(&cb.data, bo.bytes, bo.size);
+        PMIx_Data_buffer_load(dbuf, bo.bytes, bo.size);  // removes data from the byte object
+    }
+    rc = cb.status;
+    PMIX_DESTRUCT(&cb);
+    return rc;
 }
 
 pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
@@ -1001,6 +1173,9 @@ pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
     pmix_proc_t pcs;
     pmix_status_t rc = PMIX_SUCCESS;
     pmix_list_t rank_blobs;
+    pmix_buffer_t dbuf;
+    pmix_byte_object_t bo;
+    pmix_info_t info;
     pmix_value_array_t key_count_array = PMIX_VALUE_ARRAY_STATIC_INIT;
     uint32_t *key_count = NULL;
     char **kmap = NULL;
@@ -1042,10 +1217,20 @@ pmix_status_t pmix_server_collect_data(pmix_server_trkr_t *trk,
             }
         }
     }
-    rc = pack_result(trk->collect_type, buf, kmap, kmap_type, &rank_blobs);
+    PMIX_CONSTRUCT(&dbuf, pmix_buffer_t);
+    rc = pack_result(trk->collect_type, &dbuf, kmap, kmap_type, &rank_blobs);
     PMIX_LIST_DESTRUCT(&rank_blobs);
-
     PMIx_Argv_free(kmap);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    PMIX_UNLOAD_BUFFER(&dbuf, bo.bytes, bo.size);
+    PMIX_DESTRUCT(&dbuf);
+
+    PMIX_INFO_LOAD(&info, PMIX_GROUP_ENDPT_DATA, &bo, PMIX_BYTE_OBJECT);
+    PMIX_BFROPS_PACK(rc, pmix_globals.mypeer, buf, &info, 1, PMIX_INFO);
+    PMIX_INFO_DESTRUCT(&info);
+    PMIX_BYTE_OBJECT_DESTRUCT(&bo);
     return rc;
 }
 

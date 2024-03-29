@@ -899,6 +899,10 @@ PMIX_EXPORT pmix_status_t PMIx_server_deregister_resources(pmix_info_t info[], s
 PMIX_EXPORT pmix_status_t PMIx_server_collect_proc_data(pmix_proc_t *procs, size_t nprocs,
                                                         pmix_data_buffer_t *buf);
 
+/* collect job-level info for an array of procs */
+PMIX_EXPORT pmix_status_t PMIx_server_collect_job_info(pmix_proc_t *procs, size_t nprocs,
+                                                       pmix_data_buffer_t *dbuf);
+
 
 #if defined(c_plusplus) || defined(__cplusplus)
 }

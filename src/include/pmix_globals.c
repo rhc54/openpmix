@@ -409,6 +409,7 @@ PMIX_EXPORT PMIX_CLASS_INSTANCE(pmix_get_logic_t,
 static void cbcon(pmix_cb_t *p)
 {
     PMIX_CONSTRUCT_LOCK(&p->lock);
+    p->status = PMIX_SUCCESS;
     p->checked = false;
     PMIX_CONSTRUCT(&p->data, pmix_buffer_t);
     p->cbfunc.ptlfn = NULL;
