@@ -426,6 +426,7 @@ pmix_server_trkr_t *pmix_server_get_tracker(char *id, pmix_proc_t *procs,
                 return trk;
             }
         } else {
+            // id must have been NULL, so we know procs is not
             if (nprocs != trk->npcs) {
                 continue;
             }
@@ -1049,112 +1050,6 @@ pmix_status_t PMIx_server_collect_job_info(pmix_proc_t *procs, size_t nprocs,
     cb.procs = procs;
     cb.nprocs = nprocs;
     PMIX_THREADSHIFT(&cb, _collect_job_info);
-    PMIX_WAIT_THREAD(&cb.lock);
-
-    if (PMIX_SUCCESS == cb.status) {
-        PMIX_UNLOAD_BUFFER(&cb.data, bo.bytes, bo.size);
-        PMIx_Data_buffer_load(dbuf, bo.bytes, bo.size);  // removes data from the byte object
-    }
-    rc = cb.status;
-    PMIX_DESTRUCT(&cb);
-    return rc;
-}
-
-static void _collect_proc_data(int sd, short args, void *cbdata)
-{
-    pmix_cb_t *cb = (pmix_cb_t*)cbdata;
-    pmix_value_array_t key_count_array = PMIX_VALUE_ARRAY_STATIC_INIT;
-    uint32_t *key_count = NULL;
-    char **kmap = NULL;
-    pmix_nspace_caddy_t *ncd;
-    size_t sz;
-    bool found;
-    pmix_gds_modex_key_fmt_t kmap_type;
-    pmix_list_t rank_blobs, nspaces;
-    pmix_namespace_t *nm, *ns;
-    pmix_buffer_t buf;
-    pmix_status_t rc;
-    PMIX_HIDE_UNUSED_PARAMS(sd, args);
-
-    PMIX_ACQUIRE_OBJECT(cb);
-
-    PMIX_CONSTRUCT(&nspaces, pmix_list_t);
-    PMIX_CONSTRUCT(&key_count_array, pmix_value_array_t);
-    pmix_value_array_init(&key_count_array, sizeof(uint32_t));
-
-    for (sz=0; sz < cb->nprocs; sz++) {
-        get_key(&cb->procs[sz], &kmap, &key_count_array, key_count);
-        found = false;
-        PMIX_LIST_FOREACH(ncd, &nspaces, pmix_nspace_caddy_t) {
-            if (PMIX_CHECK_NSPACE(ncd->ns->nspace, cb->procs[sz].nspace)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            // find the namespace in our global array - must be present
-            // or else it wasn't registered with us
-            ns = NULL;
-            PMIX_LIST_FOREACH(nm, &pmix_globals.nspaces, pmix_namespace_t) {
-                if (PMIX_CHECK_NSPACE(cb->procs[sz].nspace, nm->nspace)) {
-                    ns = nm;
-                    break;
-                }
-            }
-            if (NULL == ns) {
-                // should never happen, but continue if it does
-                // as some hosts may not register all nspaces
-                continue;
-            }
-            ncd = PMIX_NEW(pmix_nspace_caddy_t);
-            PMIX_RETAIN(ns);
-            ncd->ns = ns;
-            pmix_list_append(&nspaces, &ncd->super);
-        }
-    }
-    kmap_type = select_maptype(kmap, &key_count_array);
-
-    PMIX_CONSTRUCT(&rank_blobs, pmix_list_t);
-    for (sz=0; sz < cb->nprocs; sz++) {
-        rc = get_remote_modex(&cb->procs[sz], kmap_type, kmap, &nspaces, &rank_blobs);
-        // it is okay if we don't find anything for this proc
-        // as it may not be local and/or the app may not have
-        // done a global fence that shared data
-        if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
-            cb->status = rc;
-            goto done;
-        }
-    }
-
-    PMIX_CONSTRUCT(&buf, pmix_buffer_t);
-    rc = pack_result(PMIX_COLLECT_YES, &buf, kmap, kmap_type, &rank_blobs);
-    if (PMIX_SUCCESS != rc) {
-        cb->status = rc;
-    }
-
-done:
-    PMIX_DESTRUCT(&key_count_array);
-    PMIX_LIST_DESTRUCT(&nspaces);
-    PMIX_LIST_DESTRUCT(&rank_blobs);
-    PMIx_Argv_free(kmap);
-
-    PMIX_WAKEUP_THREAD(&cb->lock);
-    PMIX_POST_OBJECT(cb);
-}
-
-pmix_status_t PMIx_server_collect_proc_data(pmix_proc_t *procs, size_t nprocs,
-                                            pmix_data_buffer_t *dbuf)
-{
-    pmix_cb_t cb;
-    pmix_byte_object_t bo;
-    pmix_status_t rc;
-
-    // we need to threadshift this request as it accesses
-    // global data
-    PMIX_CONSTRUCT(&cb, pmix_cb_t);
-    cb.procs = procs;
-    cb.nprocs = nprocs;
-    PMIX_THREADSHIFT(&cb, _collect_proc_data);
     PMIX_WAIT_THREAD(&cb.lock);
 
     if (PMIX_SUCCESS == cb.status) {

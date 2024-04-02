@@ -251,8 +251,6 @@ int main(int argc, char **argv)
             // two procs are performing the bootstrap
             n = 2;
             PMIX_INFO_LOAD(&info[0], PMIX_GROUP_BOOTSTRAP, &n, PMIX_SIZE);
-            n = 2;
-            PMIX_INFO_LOAD(&info[0], PMIX_GROUP_BOOTSTRAP, &n, PMIX_SIZE);
 
             // add the rest of the child job
             PMIX_DATA_ARRAY_CONSTRUCT(&dry, 1, PMIX_PROC);
