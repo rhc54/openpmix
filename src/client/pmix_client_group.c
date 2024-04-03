@@ -487,9 +487,9 @@ PMIX_EXPORT pmix_status_t PMIx_Group_construct(const char grp[], const pmix_proc
         }
     }
 
-    /* if procs is NULL or bootstrap, then the caller is involved in
-     * a bootstrap roup creation operation - it will be included by
-     * invitation, so we need to register the invite handler */
+    /* if procs is NULL or bootstrap was declared, then the caller is
+     * involved in a bootstrap group creation operation - it will be
+     * included by invitation, so we need to register the invite handler */
     if (NULL == procs || bootstrap) {
         pmix_output_verbose(2, pmix_client_globals.group_output,
                             "pmix: group_construct bootstrap operation");
