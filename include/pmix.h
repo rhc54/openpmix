@@ -1549,7 +1549,7 @@ PMIX_EXPORT pmix_status_t PMIx_Data_load(pmix_data_buffer_t *buffer,
 * @param buffer A pointer to the buffer into which the payload is to
 * be loaded.
 *
-* @param payload A pointer to the pmix_byte_object_t .containing the
+* @param payload A pointer to the pmix_byte_object_t containing the
 * desired payload
 *
 * @retval PMIX_SUCCESS The request was successfully completed
@@ -2111,6 +2111,14 @@ PMIX_EXPORT pmix_status_t PMIx_Info_list_add(void *ptr,
                                              const char *key,
                                              const void *value,
                                              pmix_data_type_t type);
+
+PMIX_EXPORT pmix_status_t PMIx_Info_list_add_value(void *ptr,
+                                                   const char *key,
+                                                   const pmix_value_t *value);
+
+PMIX_EXPORT pmix_status_t PMIx_Info_list_add_value_unique(void *ptr,
+                                                          const char *key,
+                                                          const pmix_value_t *value);
 
 PMIX_EXPORT pmix_status_t PMIx_Info_list_prepend(void *ptr,
                                                  const char *key,

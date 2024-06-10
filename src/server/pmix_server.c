@@ -1136,7 +1136,8 @@ static void _register_nspace(int sd, short args, void *cbdata)
 
     PMIX_ACQUIRE_OBJECT(caddy);
 
-    pmix_output_verbose(2, pmix_server_globals.base_output, "pmix:server _register_nspace %s",
+    pmix_output_verbose(2, pmix_server_globals.base_output,
+                        "pmix:server _register_nspace %s",
                         cd->proc.nspace);
 
     PMIX_HIDE_UNUSED_PARAMS(sd, args);
@@ -1159,9 +1160,11 @@ static void _register_nspace(int sd, short args, void *cbdata)
         pmix_list_append(&pmix_globals.nspaces, &nptr->super);
     }
     if (0 > cd->nlocalprocs) {
-        gds = nptr->compat.gds;
-        if (NULL != gds) {
-            /* this is just an update */
+        /* this is just an update, so we store it
+         * in our hash datastore until someone
+         * requests it */
+        gds = pmix_globals.mypeer->nptr->compat.gds;
+        if (NULL != gds && NULL != gds->store) {
             for (i=0; i < cd->ninfo; i++) {
                 if (PMIX_CHECK_KEY(&cd->info[i], PMIX_PROC_DATA)) {
                     iptr = (pmix_info_t*)cd->info[i].value.data.darray->array;

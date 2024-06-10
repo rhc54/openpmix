@@ -4,7 +4,7 @@
  *                         All rights reserved.
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023      Triad National Security, LLC. All rights reserved.
  * $COPYRIGHT$
  *
@@ -461,6 +461,14 @@ PMIX_EXPORT pmix_status_t PMIx_Info_list_add(void *ptr,
                                              const char *key,
                                              const void *value,
                                              pmix_data_type_t type);
+
+PMIX_EXPORT pmix_status_t PMIx_Info_list_add_value(void *ptr,
+                                                   const char *key,
+                                                   const pmix_value_t *value);
+
+PMIX_EXPORT pmix_status_t PMIx_Info_list_add_value_unique(void *ptr,
+                                                          const char *key,
+                                                          const pmix_value_t *value);
 
 PMIX_EXPORT pmix_status_t PMIx_Info_list_prepend(void *ptr,
                                                  const char *key,

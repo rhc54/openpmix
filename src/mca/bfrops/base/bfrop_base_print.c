@@ -14,7 +14,7 @@
  * Copyright (c) 2016      Mellanox Technologies, Inc.
  *                         All rights reserved.
  * Copyright (c) 2022      Triad National Security, LLC. All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -1031,7 +1031,7 @@ pmix_status_t pmix_bfrops_base_print_info_directives(char **output, char *prefix
     PMIX_HIDE_UNUSED_PARAMS(type);
 
     tmp = PMIx_Info_directives_string(*src);
-    if (0 > asprintf(output, "%sData type: PMIX_INFO_DIRECTIVES\tValue: %s",
+    if (0 > asprintf(output, "%sPMIX_INFO_DIRECTIVES\tValue: %s",
                      (NULL == prefix) ? " " : prefix, tmp)) {
         free(tmp);
         return PMIX_ERR_NOMEM;
