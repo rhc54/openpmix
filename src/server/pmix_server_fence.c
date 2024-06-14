@@ -380,7 +380,7 @@ pmix_server_trkr_t *pmix_server_new_tracker(char *id, pmix_proc_t *procs,
                         (int) nprocs);
 
     /* bozo check - should never happen outside of programmer error */
-    if (NULL == procs) {
+    if (NULL == procs && NULL == id) {
         PMIX_ERROR_LOG(PMIX_ERR_BAD_PARAM);
         return NULL;
     }
@@ -395,9 +395,17 @@ pmix_server_trkr_t *pmix_server_new_tracker(char *id, pmix_proc_t *procs,
         PMIX_ERROR_LOG(PMIX_ERR_NOMEM);
         return NULL;
     }
+    trk->type = type;
 
     if (NULL != id) {
         trk->id = strdup(id);
+    }
+
+    if (NULL == procs) {
+        // we are done
+        trk->def_complete = true;
+        pmix_list_append(&pmix_server_globals.collectives, &trk->super);
+        return trk;
     }
 
     /* copy the procs */
@@ -409,7 +417,6 @@ pmix_server_trkr_t *pmix_server_new_tracker(char *id, pmix_proc_t *procs,
     }
     memcpy(trk->pcs, procs, nprocs * sizeof(pmix_proc_t));
     trk->npcs = nprocs;
-    trk->type = type;
     trk->local = true;
     trk->nlocal = 0;
 
