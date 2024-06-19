@@ -350,6 +350,55 @@ static void errhandler_reg_callbk(pmix_status_t status, size_t errhandler_ref, v
     PMIX_WAKEUP_THREAD(&cb->lock);
 }
 
+static pmix_status_t get_endpts(pmix_info_t *xfer,
+                                pmix_scope_t scope,
+                                bool *endpts)
+{
+    pmix_cb_t cb2;
+    bool found;
+    pmix_kval_t *kv;
+    void *ilist;
+    pmix_status_t rc;
+    pmix_data_array_t darray;
+
+    PMIX_CONSTRUCT(&cb2, pmix_cb_t);
+    cb2.proc = &pmix_globals.myid;
+    cb2.scope = scope;
+    cb2.copy = true;
+    PMIX_GDS_FETCH_KV(rc, pmix_globals.mypeer, &cb2);
+    if (PMIX_SUCCESS == rc) {
+        ilist = PMIx_Info_list_start();
+        // start with our procID
+        PMIx_Info_list_add(ilist, PMIX_PROCID, &pmix_globals.myid, PMIX_PROC);
+        // add the scope
+        PMIx_Info_list_add(ilist, PMIX_DATA_SCOPE, &cb2.scope, PMIX_SCOPE);
+        // now add the kvals
+        found = false;
+        PMIX_LIST_FOREACH (kv, &cb2.kvs, pmix_kval_t) {
+            if (PMIx_Check_reserved_key(kv->key)) {
+                continue;
+            }
+            PMIx_Info_list_add_value_unique(ilist, kv->key, kv->value);
+            found = true;
+        }
+        if (found) {
+            // convert to array
+            rc = PMIx_Info_list_convert(ilist, &darray);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                PMIx_Info_list_release(ilist);
+                return rc;
+            }
+            // insert into a pmix_info_t for packing
+            PMIX_INFO_LOAD(xfer, PMIX_PROC_DATA, &darray, PMIX_DATA_ARRAY);
+            PMIX_DATA_ARRAY_DESTRUCT(&darray);
+            *endpts = true;
+        }
+        PMIx_Info_list_release(ilist);
+    }
+    PMIX_DESTRUCT(&cb2);
+    return PMIX_SUCCESS;
+}
 
 static pmix_status_t construct_msg(pmix_buffer_t *msg,
                                    const char *grp,
@@ -358,14 +407,9 @@ static pmix_status_t construct_msg(pmix_buffer_t *msg,
 {
     pmix_status_t rc;
     pmix_cmd_t cmd = PMIX_GROUP_CONSTRUCT_CMD;
-    pmix_cb_t cb2;
-    pmix_buffer_t pbkt;
-    pmix_kval_t *kv;
-    pmix_info_t xfer, *icopy, *iarray, *iptr;
-    pmix_data_array_t darray;
+    pmix_info_t local_endpts, *icopy, *iarray, *iptr;
     size_t sz, n, m;
-    bool endpt, found;
-    void *ilist;
+    bool lclendpts;
 
     /* pack the cmd */
     PMIX_BFROPS_PACK(rc, pmix_client_globals.myserver, msg, &cmd, 1, PMIX_COMMAND);
@@ -396,97 +440,51 @@ static pmix_status_t construct_msg(pmix_buffer_t *msg,
     }
 
     /* get our endpt info, if some was posted. We use
-     * the global scope here as groups may involve
-     * cross-nspace, and so the local endpts may
-     * be relevant */
-    PMIX_CONSTRUCT(&cb2, pmix_cb_t);
-    cb2.proc = &pmix_globals.myid;
-    cb2.scope = PMIX_GLOBAL;
-    cb2.copy = true;
-    endpt = false;
-    PMIX_GDS_FETCH_KV(rc, pmix_globals.mypeer, &cb2);
-    if (PMIX_SUCCESS == rc) {
-        ilist = PMIx_Info_list_start();
-        PMIX_CONSTRUCT(&pbkt, pmix_buffer_t);
-        // start with our procID
-        PMIx_Info_list_add(ilist, PMIX_PROCID, &pmix_globals.myid, PMIX_PROC);
-        // now add the kvals
-        found = false;
-        PMIX_LIST_FOREACH (kv, &cb2.kvs, pmix_kval_t) {
-            if (PMIx_Check_reserved_key(kv->key)) {
-                continue;
-            }
-            PMIx_Info_list_add_value_unique(ilist, kv->key, kv->value);
-            found = true;
-        }
-        if (found) {
-            // convert to array
-            rc = PMIx_Info_list_convert(ilist, &darray);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                PMIX_RELEASE(msg);
-                PMIx_Info_list_release(ilist);
-                return rc;
-            }
-            // insert into a pmix_info_t for packing
-            PMIX_INFO_LOAD(&xfer, PMIX_PROC_DATA, &darray, PMIX_DATA_ARRAY);
-            PMIX_DATA_ARRAY_DESTRUCT(&darray);
-            endpt = true;
-        }
-        PMIx_Info_list_release(ilist);
+     * only remote scopes here as local endpts should
+     * be locally accessible to anyone */
+    sz = ninfo;
+    lclendpts = false;
+    rc = get_endpts(&local_endpts, PMIX_LOCAL, &lclendpts);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
     }
-    PMIX_DESTRUCT(&cb2);
+    if (lclendpts) {
+        sz = sz + 1;
+    }
+    PMIX_INFO_CREATE(icopy, sz);
 
     // check for group info
-    if (0 < ninfo) {
-        // if we have endpt data, expand the info array
-        if (endpt) {
-            PMIX_INFO_CREATE(icopy, ninfo + 1);
-            sz = ninfo + 1;
-        } else {
-            PMIX_INFO_CREATE(icopy, ninfo);
-            sz = ninfo;
-        }
-        for (n=0; n < ninfo; n++) {
-            if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_INFO)) {
-                iarray = (pmix_info_t*)info[n].value.data.darray->array;
-                sz = info[n].value.data.darray->size;
-                // check if the first entry is our procID
-                if (PMIX_PROC != iarray[0].value.type) {
-                    // we need to add our ID to the beginning of the array
-                    PMIX_INFO_CREATE(iptr, sz+1);
-                    PMIX_INFO_LOAD(&iptr[0], PMIX_PROCID, &pmix_globals.myid, PMIX_PROC);
-                    for (m=0; m < sz; m++) {
-                        PMIX_INFO_XFER(&iptr[m+1], &iarray[m]);
-                    }
-                    PMIx_Load_key(icopy[n].key, PMIX_GROUP_INFO);
-                    icopy[n].value.type = PMIX_DATA_ARRAY;
-                    icopy[n].value.data.darray = (pmix_data_array_t*)pmix_malloc(sizeof(pmix_data_array_t));
-                    icopy[n].value.data.darray->type = PMIX_INFO;
-                    icopy[n].value.data.darray->array = iptr;
-                    icopy[n].value.data.darray->size = sz + 1;
-                } else {
-                    PMIX_INFO_XFER(&icopy[n], &info[n]);
+    for (n=0; n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_INFO)) {
+            iarray = (pmix_info_t*)info[n].value.data.darray->array;
+            sz = info[n].value.data.darray->size;
+            // check if the first entry is our procID
+            if (PMIX_PROC != iarray[0].value.type) {
+                // we need to add our ID to the beginning of the array
+                PMIX_INFO_CREATE(iptr, sz+1);
+                PMIX_INFO_LOAD(&iptr[0], PMIX_PROCID, &pmix_globals.myid, PMIX_PROC);
+                for (m=0; m < sz; m++) {
+                    PMIX_INFO_XFER(&iptr[m+1], &iarray[m]);
                 }
+                PMIx_Load_key(icopy[n].key, PMIX_GROUP_INFO);
+                icopy[n].value.type = PMIX_DATA_ARRAY;
+                icopy[n].value.data.darray = (pmix_data_array_t*)pmix_malloc(sizeof(pmix_data_array_t));
+                icopy[n].value.data.darray->type = PMIX_INFO;
+                icopy[n].value.data.darray->array = iptr;
+                icopy[n].value.data.darray->size = sz + 1;
             } else {
                 PMIX_INFO_XFER(&icopy[n], &info[n]);
             }
+        } else {
+            PMIX_INFO_XFER(&icopy[n], &info[n]);
         }
-        if (endpt) {
-            // add the endpt data
-            PMIX_INFO_XFER(&icopy[ninfo], &xfer);
-            PMIX_INFO_DESTRUCT(&xfer);
-        }
-
-    } else if (endpt) {
-        // send the endpt data
-        sz = 1;
-        PMIX_INFO_CREATE(icopy, sz);
-        PMIX_INFO_XFER(&icopy[0], &xfer);
-        PMIX_INFO_DESTRUCT(&xfer);
-
-    } else {
-        sz = 0;
+    }
+    if (lclendpts) {
+        // add the local endpt data
+        PMIX_INFO_XFER(&icopy[n], &local_endpts);
+        PMIX_INFO_DESTRUCT(&local_endpts);
+        ++n;
     }
 
     /* pack the info structs */
