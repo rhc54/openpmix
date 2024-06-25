@@ -884,6 +884,18 @@ PMIX_EXPORT pmix_status_t PMIx_server_delete_process_set(char *pset_name);
 
 
 /* Register non-namespace related information with the local PMIx server library.
+ * This API can be used for a variety of purposes. For example, one could use it
+ * to register information on the physical cluster that you want passed to every
+ * nspace during "register nspace".
+ *
+ * Another usage is to register data collected during various operations - e.g.,
+ * PMIx_Group_construct when returning group and endpoint information during a
+ * bootstrap operation. In such cases, not every local host will have at least
+ * one client involved in directly calling the construct API - i.e., all local
+ * "participants" may be doing so as "add members" and just waiting for an invite
+ * event. Thus, there is no callback function registered by the PMIx server
+ * library that can be used to store the returned endpoint, group info, and job
+ * data. This API fills that hole
  */
 PMIX_EXPORT pmix_status_t PMIx_server_register_resources(pmix_info_t info[], size_t ninfo,
                                                          pmix_op_cbfunc_t cbfunc,

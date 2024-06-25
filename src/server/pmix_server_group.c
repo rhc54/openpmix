@@ -85,17 +85,10 @@ static void _grpcbfunc(int sd, short args, void *cbdata)
     pmix_server_caddy_t *cd;
     pmix_buffer_t *reply;
     pmix_status_t ret;
-    size_t m, n, ctxid = SIZE_MAX, nmembers = 0;
-    size_t ninfo, npinfo;
+    size_t n, ctxid = SIZE_MAX, nmembers = 0;
     pmix_proc_t *members = NULL;
-    pmix_proc_t *proc;
     pmix_byte_object_t *jbo = NULL;
     bool ctxid_given = false;
-    pmix_list_t grpinfo, endpts;
-    pmix_info_caddy_t *g, *ept;
-    pmix_info_t *iptr, *pinfo;
-    pmix_kval_t kv;
-    pmix_scope_t scope;
     PMIX_HIDE_UNUSED_PARAMS(sd, args);
 
     PMIX_ACQUIRE_OBJECT(scd);
@@ -121,8 +114,6 @@ static void _grpcbfunc(int sd, short args, void *cbdata)
     }
 
     /* see if this group was assigned a context ID or collected data */
-    PMIX_CONSTRUCT(&grpinfo, pmix_list_t);
-    PMIX_CONSTRUCT(&endpts, pmix_list_t);
     for (n = 0; n < scd->ninfo; n++) {
         if (PMIX_CHECK_KEY(&scd->info[n], PMIX_GROUP_CONTEXT_ID)) {
             PMIX_VALUE_GET_NUMBER(ret, &scd->info[n].value, ctxid, size_t);
@@ -132,62 +123,15 @@ static void _grpcbfunc(int sd, short args, void *cbdata)
                 ctxid_given = true;
             }
 
-        } else if (PMIX_CHECK_KEY(&scd->info[n], PMIX_GROUP_ENDPT_DATA)) {
-            ept = PMIX_NEW(pmix_info_caddy_t);
-            ept->info = &scd->info[n];
-            ept->ninfo = 1;
-            pmix_list_append(&endpts, &ept->super);
-
         } else if (PMIX_CHECK_KEY(&scd->info[n], PMIX_GROUP_MEMBERSHIP)) {
             members = (pmix_proc_t*)scd->info[n].value.data.darray->array;
             nmembers = scd->info[n].value.data.darray->size;
-
-        } else if (PMIX_CHECK_KEY(&scd->info[n], PMIX_GROUP_INFO)) {
-            g = PMIX_NEW(pmix_info_caddy_t);
-            g->info = &scd->info[n];
-            pmix_list_append(&grpinfo, &g->super);
 
         } else if (PMIX_CHECK_KEY(&scd->info[n], PMIX_GROUP_JOB_INFO)) {
             jbo = &scd->info[n].value.data.bo;
 
         }
     }
-
-    /* if endpt data was returned, then we need to
-     * store it in our hash table before releasing
-     * the group members */
-    if (0 < pmix_list_get_size(&endpts)) {
-        /* Each list member points to a pmix_info_t that contains
-         * a data array of info about that proc */
-        PMIX_LIST_FOREACH(ept, &endpts, pmix_info_caddy_t) {
-            iptr = (pmix_info_t*)ept->info->value.data.darray->array;
-            ninfo = ept->info->value.data.darray->size;
-
-            // contains an array of proc info arrays
-            for (n=0; n < ninfo; n++) {
-                pinfo = (pmix_info_t*)iptr[n].value.data.darray->array;
-                npinfo = iptr[n].value.data.darray->size;
-                // procID is in the first position
-                proc = pinfo[0].value.data.proc;
-                // scope is in the second position
-                scope = pinfo[1].value.data.scope;
-                // rest of the array contains endpts
-                for (m=2; m < npinfo; m++) {
-                    kv.key = pinfo[m].key;
-                    kv.value = &pinfo[m].value;
-                    ret = pmix_globals.mypeer->nptr->compat.gds->store(proc, scope, &kv);
-                    if (PMIX_SUCCESS != ret) {
-                        PMIX_ERROR_LOG(ret);
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    // if group info was returned, then we need to store it
-    // as well before releasing the group members
-
 
     // if job info was returned, then we need to store it
     // as well before releasing the group members

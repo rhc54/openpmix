@@ -130,10 +130,9 @@ static void op_cbfunc_rel(pmix_status_t status, void *cbdata);
 
 static void info_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo, void *cbdata,
                         pmix_release_cbfunc_t release_fn, void *release_cbdata);
-static pmix_status_t add_group(const char *grpid, pmix_proc_t *members, size_t nmembers);
-
-static pmix_status_t process_grpinfo(size_t ctxid, pmix_data_array_t *d);
-
+static pmix_status_t add_group(const char *grpid,
+                               size_t ctxid,
+                               pmix_proc_t *members, size_t nmembers);
 
 // the invite handler
 static void inviterel(void *cbdata)
@@ -151,14 +150,8 @@ static void invite_hdlr(size_t evhdlr_registration_id, pmix_status_t status,
     pmix_status_t rc;
     size_t n, ctxid;
     bool ourop = false;
-    bool gotctxid = false;
     pmix_proc_t *members = NULL;
     size_t nmembers;
-    pmix_byte_object_t *pbo = NULL, bo;
-    pmix_buffer_t jobinfo, bkt;
-    pmix_data_array_t *darray = NULL;
-    char *nspace;
-    int32_t cnt;
 
     PMIX_HIDE_UNUSED_PARAMS(evhdlr_registration_id, source, results, nresults);
 
@@ -196,18 +189,10 @@ static void invite_hdlr(size_t evhdlr_registration_id, pmix_status_t status,
             members = (pmix_proc_t*)info[n].value.data.darray->array;
             nmembers = info[n].value.data.darray->size;
 
-        } else if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_JOB_INFO)) {
-            pbo = (pmix_byte_object_t*)&info[n].value.data.bo;
-
-        } else if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_INFO_ARRAY)) {
-            darray = info[n].value.data.darray;
-
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_CONTEXT_ID)) {
             PMIX_VALUE_GET_NUMBER(rc, &info[n].value, ctxid, size_t);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
-            } else {
-                gotctxid = true;
             }
         }
     }
@@ -233,55 +218,8 @@ static void invite_hdlr(size_t evhdlr_registration_id, pmix_status_t status,
     if (NULL != members) {
         /* since the group construction has finished, we can add
          * the group to our list of groups. */
-        rc = add_group(cd->grpid, members, nmembers);
+        rc = add_group(cd->grpid, ctxid, members, nmembers);
         if (PMIX_SUCCESS != rc && PMIX_EXISTS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-    }
-
-    // if job info was provided, process it
-    if (NULL != pbo) {
-        /* load it for unpacking */
-        PMIX_CONSTRUCT(&jobinfo, pmix_buffer_t);
-        PMIX_LOAD_BUFFER(pmix_client_globals.myserver, &jobinfo, pbo->bytes, pbo->size);
-
-        cnt = 1;
-        PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, &jobinfo, &bo, &cnt, PMIX_BYTE_OBJECT);
-        while (PMIX_SUCCESS == rc) {
-            /* load it for unpacking */
-            PMIX_CONSTRUCT(&bkt, pmix_buffer_t);
-            PMIX_LOAD_BUFFER(pmix_client_globals.myserver, &bkt, bo.bytes, bo.size);
-
-            /* unpack the nspace for this blob */
-            cnt = 1;
-            PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, &bkt, &nspace, &cnt, PMIX_STRING);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                PMIX_DESTRUCT(&bkt);
-                continue;
-            }
-            if (!PMIX_CHECK_NSPACE(nspace, pmix_globals.myid.nspace)) {
-                /* extract and process any proc-related info for this nspace */
-                PMIX_GDS_STORE_JOB_INFO(rc, pmix_globals.mypeer, nspace, &bkt);
-                if (PMIX_SUCCESS != rc) {
-                    PMIX_ERROR_LOG(rc);
-                }
-            }
-            free(nspace);
-            PMIX_DESTRUCT(&bkt);
-            /* get the next one */
-            cnt = 1;
-            PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, &jobinfo, &bo, &cnt, PMIX_BYTE_OBJECT);
-        }
-        if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-    }
-
-    // if group info was provided, process it
-    if (NULL != darray && gotctxid) {
-        rc = process_grpinfo(ctxid, darray);
-        if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
         }
     }
@@ -1568,16 +1506,12 @@ static void construct_cbfunc(struct pmix_peer_t *pr,
     pmix_status_t rc;
     pmix_status_t ret;
     int32_t cnt;
-    size_t ctxid, ninfo = 0, n;
+    size_t ctxid = SIZE_MAX, ninfo = 0, n;
     pmix_info_t *iptr = NULL;
     bool gotctxid = false;
-    bool gotgrpinfo = false;
-    pmix_data_array_t darray;
     pmix_proc_t *members = NULL;
     size_t nmembers = 0;
-    char *nspace;
-    pmix_buffer_t bkt;
-    pmix_byte_object_t bo;
+    pmix_data_array_t darray;
 
     PMIX_HIDE_UNUSED_PARAMS(pr, hdr);
 
@@ -1608,9 +1542,6 @@ static void construct_cbfunc(struct pmix_peer_t *pr,
     if (PMIX_SUCCESS != ret) {
         goto report;
     }
-
-    /* ALL REMAINING UNPACKS ARE OPTIONAL, SO DO NOT ERROR LOG
-     * IF THEY ARE NOT PRESENT */
 
     /* unpack the final membership */
     cnt = 1;
@@ -1649,89 +1580,20 @@ static void construct_cbfunc(struct pmix_peer_t *pr,
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             ret = rc;
-            goto report;
         }
     }
 
-    // unpack any group info that was provided
-    cnt = 1;
-    PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, buf, &gotgrpinfo, &cnt, PMIX_BOOL);
-    if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER == rc) {
-        goto report;
-    } else if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        ret = rc;
-        goto report;
-    }
-    if (gotgrpinfo) {
-        cnt = 1;
-        PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, buf, &darray, &cnt, PMIX_DATA_ARRAY);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            ret = rc;
-            goto report;
-        }
-    }
-    // processing this info requires that we received a ctxID
-    if (gotctxid && gotgrpinfo ) {
-        rc = process_grpinfo(ctxid, &darray);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            ret = rc;
-            PMIX_DATA_ARRAY_DESTRUCT(&darray);
-            goto report;
-        }
-    }
-
-    /* group construct has to also pass back data from all nspace's involved in
-     * the operation, including our own. Each will come as a byte object */
-    cnt = 1;
-    PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, buf, &bo, &cnt, PMIX_BYTE_OBJECT);
-    if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER == rc) {
-        goto report;
-    }
-
-    while (PMIX_SUCCESS == rc) {
-        /* load it for unpacking */
-        PMIX_CONSTRUCT(&bkt, pmix_buffer_t);
-        PMIX_LOAD_BUFFER(pmix_client_globals.myserver, &bkt, bo.bytes, bo.size);
-
-        /* unpack the nspace for this blob */
-        cnt = 1;
-        PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, &bkt, &nspace, &cnt, PMIX_STRING);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DESTRUCT(&bkt);
-            continue;
-        }
-        /* extract and process any proc-related info for this nspace */
-        PMIX_GDS_STORE_JOB_INFO(rc, pmix_globals.mypeer, nspace, &bkt);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-        free(nspace);
-        PMIX_DESTRUCT(&bkt);
-        /* get the next one */
-        cnt = 1;
-        PMIX_BFROPS_UNPACK(rc, pmix_client_globals.myserver, buf, &bo, &cnt, PMIX_BYTE_OBJECT);
-    }
-    if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER != rc) {
-        PMIX_ERROR_LOG(rc);
-        ret = rc;
-    }
 
 report:
     /* since the group construction has finished, we can add
      * the group to out list of groups. */
     if (NULL != members) {
-        rc = add_group(cb->grpid, members, nmembers);
+        rc = add_group(cb->grpid, ctxid, members, nmembers);
 
         darray.array = members;
         darray.size = nmembers;
         darray.type = PMIX_PROC;
         ++ninfo;
-    } else {
-        pmix_output(0, "MEMBERS ARE NULL");
     }
 
     ++ninfo; // account for the grpID
@@ -1826,6 +1688,8 @@ static void info_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo, v
     size_t n, nmembers = 0;
     pmix_proc_t *members = NULL;
     char *grpid = NULL;
+    size_t ctxid = SIZE_MAX;
+    pmix_status_t rc;
 
     /* see if anything was returned - e.g., a context id */
     cb->status = status;
@@ -1837,14 +1701,21 @@ static void info_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo, v
             if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_MEMBERSHIP)) {
                 members = (pmix_proc_t*)info[n].value.data.darray->array;
                 nmembers = info[n].value.data.darray->size;
+
             } else if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_ID)) {
                 grpid = info[n].value.data.string;
+
+            } else if (PMIX_CHECK_KEY(&info[n], PMIX_GROUP_CONTEXT_ID)) {
+                PMIX_VALUE_GET_NUMBER(rc, &info[n].value, ctxid, size_t);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                }
             }
             PMIX_INFO_XFER(&cb->results[n], &info[n]);
         }
     }
     if (NULL != members && NULL != grpid) {
-        add_group(grpid, members, nmembers);
+        add_group(grpid, ctxid, members, nmembers);
     }
 
     if (NULL != release_fn) {
@@ -1854,7 +1725,9 @@ static void info_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo, v
     PMIX_WAKEUP_THREAD(&cb->lock);
 }
 
-static pmix_status_t add_group(const char *grpid, pmix_proc_t *members, size_t nmembers)
+static pmix_status_t add_group(const char *grpid,
+                               size_t ctxid,
+                               pmix_proc_t *members, size_t nmembers)
 {
     pmix_group_t *grp;
 
@@ -1867,65 +1740,9 @@ static pmix_status_t add_group(const char *grpid, pmix_proc_t *members, size_t n
     qsort(grp->members, nmembers, sizeof(pmix_proc_t), pmix_util_compare_proc);
     grp->nmbrs = nmembers;
     grp->grpid = strdup(grpid);
+    grp->ctxid = ctxid;
     pmix_list_append(&pmix_client_globals.groups, &grp->super);
 
     return PMIX_SUCCESS;
 }
 
-static pmix_status_t process_grpinfo(size_t ctxid, pmix_data_array_t *d)
-{
-    pmix_info_t *info, *g, *iptr;
-    size_t n, m, ninfo, sz;
-    pmix_proc_t procid;
-    pmix_kval_t kp;
-    pmix_value_t val;
-    pmix_data_array_t darray;
-    pmix_status_t rc;
-
-    // the array consists of an array of pmix_info_t under
-    // the PMIX_GROUP_INFO key
-    info = (pmix_info_t*)d->array;
-    ninfo = d->size;
-
-    for (n=0; n < ninfo; n++) {
-        if (!PMIX_CHECK_KEY(&info[n], PMIX_GROUP_INFO)) {
-            PMIX_ERROR_LOG(PMIX_ERR_BAD_PARAM);
-            return PMIX_ERR_BAD_PARAM;
-        }
-        // extract the array
-        g = (pmix_info_t*)info[n].value.data.darray->array;
-        sz = info[n].value.data.darray->size;
-        // the first element in the array must be the procID
-        // of the process that contributed this info
-        if (!PMIX_CHECK_KEY(&g[0], PMIX_PROCID)) {
-            PMIX_ERROR_LOG(PMIX_ERR_BAD_PARAM);
-            return PMIX_ERR_BAD_PARAM;
-        }
-        memcpy(&procid, g[0].value.data.proc, sizeof(pmix_proc_t));
-        /* reconstruct each value as a qualified one based
-         * on the ctxid */
-        PMIX_CONSTRUCT(&kp, pmix_kval_t);
-        kp.value = &val;
-        kp.key = PMIX_QUALIFIED_VALUE;
-        val.type = PMIX_DATA_ARRAY;
-        for (m=0; m < sz; m++) {
-            PMIX_DATA_ARRAY_CONSTRUCT(&darray, 2, PMIX_INFO);
-            iptr = (pmix_info_t*)darray.array;
-            /* the primary value is in the first position */
-            PMIX_INFO_XFER(&iptr[0], &g[m]);
-            /* add the context ID qualifier */
-            PMIX_INFO_LOAD(&iptr[1], PMIX_GROUP_CONTEXT_ID, &ctxid, PMIX_SIZE);
-            PMIX_INFO_SET_QUALIFIER(&iptr[1]);
-            /* add it to the kval */
-            val.data.darray = &darray;
-            /* store it */
-            PMIX_GDS_STORE_KV(rc, pmix_globals.mypeer, &procid, PMIX_GLOBAL, &kp);
-            PMIX_DATA_ARRAY_DESTRUCT(&darray);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                return rc;
-            }
-        }
-    }
-    return PMIX_SUCCESS;
-}
