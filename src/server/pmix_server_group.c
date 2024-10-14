@@ -86,6 +86,7 @@ typedef struct {
     pmix_event_t ev;
     bool event_active;
     pmix_list_t mbrs;  // list of grp_trk_t
+    pmix_list_t nslist;  // list of involved nspaces
 } grp_block_t;
 static void gbcon(grp_block_t *p)
 {
@@ -93,6 +94,7 @@ static void gbcon(grp_block_t *p)
     p->grpop = PMIX_GROUP_NONE;
     p->event_active = false;
     PMIX_CONSTRUCT(&p->mbrs, pmix_list_t);
+    PMIX_CONSTRUCT(&p->nslist, pmix_list_t);
 }
 static void gbdes(grp_block_t *p)
 {
@@ -100,6 +102,7 @@ static void gbdes(grp_block_t *p)
         free(p->id);
     }
     PMIX_LIST_DESTRUCT(&p->mbrs);
+    PMIX_LIST_DESTRUCT(&p->nslist);
 }
 static PMIX_CLASS_INSTANCE(grp_block_t,
                            pmix_list_t,
@@ -108,8 +111,10 @@ static PMIX_CLASS_INSTANCE(grp_block_t,
 typedef struct {
     pmix_list_item_t super;
     pmix_lock_t lock;
+    grp_block_t *blk;
     bool host_called;
     bool local;
+    bool hybrid;
     pmix_proc_t *pcs;
     size_t npcs;
     pmix_info_t *info;
@@ -125,10 +130,11 @@ typedef struct {
 } grp_trk_t;
 static void gtcon(grp_trk_t *t)
 {
+    PMIX_CONSTRUCT_LOCK(&t->lock);
+    t->blk = NULL;
     t->host_called = false;
     t->local = true;
-    t->id = NULL;
-    PMIX_CONSTRUCT_LOCK(&t->lock);
+    t->hybrid = false;
     t->pcs = NULL;
     t->npcs = 0;
     t->info = NULL;
@@ -141,10 +147,10 @@ static void gtcon(grp_trk_t *t)
 }
 static void gtdes(grp_trk_t *t)
 {
-    if (NULL != t->id) {
-        free(t->id);
-    }
     PMIX_DESTRUCT_LOCK(&t->lock);
+    if (NULL != t->blk) {
+        PMIX_RELEASE(t->blk);
+    }
     PMIX_LIST_DESTRUCT(&t->local_cbs);
 }
 static PMIX_CLASS_INSTANCE(grp_trk_t,
@@ -159,7 +165,7 @@ typedef struct {
     pmix_status_t status;
     pmix_info_t *info;
     size_t ninfo;
-    grp_blk_t *blk;
+    grp_block_t *blk;
     union {
         pmix_release_cbfunc_t relfn;
         pmix_op_cbfunc_t opcbfn;
@@ -190,8 +196,21 @@ PMIX_EXPORT PMIX_CLASS_INSTANCE(grp_shifter_t,
 static pmix_list_t grp_collectives = PMIX_LIST_STATIC_INIT;
 
 
-static void check_completion(grp_trk_t *trk)
+/* DEFINE LOCAL FUNCTIONS */
+static pmix_status_t aggregate_info(grp_trk_t *trk,
+                                    pmix_info_t *info,
+                                    size_t ninfo);
+
+static void check_completion(grp_trk_t *trk,
+                             pmix_proc_t *procs, size_t nprocs)
 {
+    bool all_def, found;
+    pmix_nspace_t first;
+    pmix_namespace_t *ns, *nptr;
+    pmix_nspace_caddy_t *nm;
+    pmix_rank_info_t *info;
+    size_t i;
+
     all_def = true;
     PMIX_LOAD_NSPACE(first, NULL);
     for (i = 0; i < nprocs; i++) {
@@ -258,9 +277,9 @@ static void check_completion(grp_trk_t *trk)
             continue;
         }
 
-        /* check and add uniq ns into trk nslist */
+        /* check and add uniq ns into nslist for this group operation block */
         found = false;
-        PMIX_LIST_FOREACH (nm, &trk->nslist, pmix_nspace_caddy_t) {
+        PMIX_LIST_FOREACH (nm, &trk->blk->nslist, pmix_nspace_caddy_t) {
             if (0 == strcmp(nptr->nspace, nm->ns->nspace)) {
                 found = true;
                 break;
@@ -270,7 +289,7 @@ static void check_completion(grp_trk_t *trk)
             nm = PMIX_NEW(pmix_nspace_caddy_t);
             PMIX_RETAIN(nptr);
             nm->ns = nptr;
-            pmix_list_append(&trk->nslist, &nm->super);
+            pmix_list_append(&trk->blk->nslist, &nm->super);
         }
 
         /* if they want all the local members of this nspace, then
@@ -330,6 +349,10 @@ static pmix_status_t get_tracker(char *grpid, bool bootstrap,
                                  pmix_info_t *info, size_t ninfo,
                                  grp_block_t **block, grp_trk_t **tracker)
 {
+    grp_block_t *blk;
+    grp_trk_t *trk;
+    pmix_status_t rc;
+
     // see if we already have a block for this ID
     PMIX_LIST_FOREACH(blk, &grp_collectives, grp_block_t) {
         if (0 == strcmp(grpid, blk->id)) {
@@ -338,6 +361,8 @@ static pmix_status_t get_tracker(char *grpid, bool bootstrap,
             if (NULL == procs) {
                 // setup a unique tracker for this op
                 trk = PMIX_NEW(grp_trk_t);
+                PMIX_RETAIN(blk);
+                trk->blk = blk;
                 trk->info = info;
                 trk->ninfo = ninfo;
                 trk->def_complete = true;
@@ -348,9 +373,11 @@ static pmix_status_t get_tracker(char *grpid, bool bootstrap,
             // if this is a bootstrap, then it always gets its own tracker
             if (bootstrap) {
                 trk = PMIX_NEW(grp_trk_t);
-                trk->nprocs = nprocs;
-                PMIX_PROC_CREATE(trk->procs, trk->nprocs);
-                memcpy(trk->procs, procs, nprocs * sizeof(pmix_proc_t));
+                PMIX_RETAIN(blk);
+                trk->blk = blk;
+                trk->npcs = nprocs;
+                PMIX_PROC_CREATE(trk->pcs, trk->npcs);
+                memcpy(trk->pcs, procs, nprocs * sizeof(pmix_proc_t));
                 trk->info = info;
                 trk->ninfo = ninfo;
                 // bootstraps are sent as separate participants
@@ -361,14 +388,14 @@ static pmix_status_t get_tracker(char *grpid, bool bootstrap,
             }
             // check if this signature is already present
             PMIX_LIST_FOREACH(trk, &blk->mbrs, grp_trk_t) {
-                if (trk->nprocs != nprocs) {
+                if (trk->npcs != nprocs) {
                     continue;
                 }
-                if (0 == memcmp(trk->procs, procs, nprocs * sizeof(pmix_proc_t))) {
+                if (0 == memcmp(trk->pcs, procs, nprocs * sizeof(pmix_proc_t))) {
                     // matching tracker - pass it back
                     *tracker = trk;
                     // check for completion
-                    check_completion(trk);
+                    check_completion(trk, procs, nprocs);
                     // aggregate info
                     rc = aggregate_info(trk, info, ninfo);
                     return rc;
@@ -376,14 +403,16 @@ static pmix_status_t get_tracker(char *grpid, bool bootstrap,
             }
             // new signature, so create a tracker for it
             trk = PMIX_NEW(grp_trk_t);
-            trk->nprocs = nprocs;
-            PMIX_PROC_CREATE(trk->procs, trk->nprocs);
-            memcpy(trk->procs, procs, nprocs * sizeof(pmix_proc_t));
+            PMIX_RETAIN(blk);
+            trk->blk = blk;
+            trk->npcs = nprocs;
+            PMIX_PROC_CREATE(trk->pcs, trk->npcs);
+            memcpy(trk->pcs, procs, nprocs * sizeof(pmix_proc_t));
             trk->info = info;
             trk->ninfo = ninfo;
             pmix_list_append(&blk->mbrs, &trk->super);
             *tracker = trk;
-            check_completion(trk);
+            check_completion(trk, procs, nprocs);
             return PMIX_SUCCESS;
         }
     }
@@ -394,16 +423,18 @@ static pmix_status_t get_tracker(char *grpid, bool bootstrap,
     pmix_list_append(&grp_collectives, &blk->super);
     // setup a tracker for it
     trk = PMIX_NEW(grp_trk_t);
+    PMIX_RETAIN(blk);
+    trk->blk = blk;
     trk->info = info;
     trk->ninfo = ninfo;
     pmix_list_append(&blk->mbrs, &trk->super);
     if (NULL == procs) {
-        trk->def_complete == true;
+        trk->def_complete = true;
     } else {
-        trk->nprocs = nprocs;
-        PMIX_PROC_CREATE(trk->procs, trk->nprocs);
-        memcpy(trk->procs, procs, nprocs * sizeof(pmix_proc_t));
-        check_completion(trk);
+        trk->npcs = nprocs;
+        PMIX_PROC_CREATE(trk->pcs, trk->npcs);
+        memcpy(trk->pcs, procs, nprocs * sizeof(pmix_proc_t));
+        check_completion(trk, procs, nprocs);
     }
     *tracker = trk;
     return PMIX_SUCCESS;
@@ -441,7 +472,7 @@ static void _grpcbfunc(int sd, short args, void *cbdata)
 
 
         // if this is a destruct operation, there is nothing more to do
-        if (PMIX_GROUP_DESTRUCT == trk->grpop) {
+        if (PMIX_GROUP_DESTRUCT == blk->grpop) {
             goto release;
         }
 
@@ -475,7 +506,7 @@ static void _grpcbfunc(int sd, short args, void *cbdata)
                 PMIX_RELEASE(reply);
                 break;
             }
-            if (PMIX_SUCCESS == scd->status && PMIX_GROUP_CONSTRUCT == trk->grpop) {
+            if (PMIX_SUCCESS == scd->status && PMIX_GROUP_CONSTRUCT == blk->grpop) {
                 /* add the final membership */
                 PMIX_BFROPS_PACK(ret, cd->peer, reply, &nmembers, 1, PMIX_SIZE);
                 if (PMIX_SUCCESS != ret) {
@@ -570,6 +601,7 @@ static void grp_timeout(int sd, short args, void *cbdata)
     grp_block_t *blk = (grp_block_t *) cbdata;
     pmix_server_caddy_t *cd;
     pmix_buffer_t *reply;
+    grp_trk_t *trk;
     pmix_status_t ret, rc = PMIX_ERR_TIMEOUT;
     PMIX_HIDE_UNUSED_PARAMS(sd, args);
 
@@ -894,7 +926,8 @@ pmix_output(0, "recvd grpconstruct cmd from %s with %lu procs",
                  PMIX_PEER_PRINT(cd->peer), nprocs);
 
     /* find/create the local tracker for this operation */
-    rc = get_tracker(grpid, bootstrap, procs, nprocs, &blk, &trk);
+    rc = get_tracker(grpid, bootstrap, procs, nprocs,
+                     info, ninfo, &blk, &trk);
     if (PMIX_EXISTS == rc) {
         // we extended the trk's info array
         PMIX_INFO_FREE(info, ninfo);
@@ -962,7 +995,7 @@ pmix_output(0, "recvd grpconstruct cmd from %s with %lu procs",
      * to avoid a race condition whereby we release the
      * tracker object while the host is still using it */
     if (!locally_complete && trk->local &&
-        0 < tv.tv_sec && !trk->event_active) {
+        0 < tv.tv_sec && !trk->blk->event_active) {
         PMIX_THREADSHIFT_DELAY(trk, grp_timeout, tv.tv_sec);
         trk->event_active = true;
     }
