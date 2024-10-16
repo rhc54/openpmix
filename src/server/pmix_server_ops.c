@@ -1516,7 +1516,8 @@ pmix_status_t pmix_server_process_iof(pmix_peer_t *peer,
             continue;
         }
         pmix_output_verbose(2, pmix_server_globals.iof_output,
-                            "PMIX:SERVER:SPAWN delivering cached IOF from %s to %s",
+                            "[%s] PMIX:SERVER:SPAWN delivering cached IOF from %s to %s",
+                            PMIX_NAME_PRINT(&pmix_globals.myid),
                             PMIX_NAME_PRINT(&iof->source),
                             PMIX_PNAME_PRINT(&req->requestor->info->pname));
         /* setup the msg */

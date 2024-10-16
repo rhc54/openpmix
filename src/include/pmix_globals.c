@@ -321,6 +321,7 @@ static void iofreqcon(pmix_iof_req_t *p)
     p->procs = NULL;
     p->nprocs = 0;
     p->channels = PMIX_FWD_NO_CHANNELS;
+    memset(&p->flags, 0, sizeof(pmix_iof_flags_t));
     p->cbfunc = NULL;
     p->regcbfunc = NULL;
     p->cbdata = NULL;
