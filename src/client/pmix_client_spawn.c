@@ -162,8 +162,9 @@ PMIX_EXPORT pmix_status_t PMIx_Spawn_nb(const pmix_info_t job_info[], size_t nin
     PMIX_ACQUIRE_THREAD(&pmix_global_lock);
 
     pmix_output_verbose(2, pmix_client_globals.spawn_output,
-                        "%s pmix: spawn_nb called",
-                        PMIX_NAME_PRINT(&pmix_globals.myid));
+                        "%s pmix: spawn_nb called with %s cbfunc",
+                        PMIX_NAME_PRINT(&pmix_globals.myid),
+                        (NULL == cbfunc) ? "NULL" : "NON-NULL");
 
     if (pmix_globals.init_cntr <= 0) {
         PMIX_RELEASE_THREAD(&pmix_global_lock);
@@ -430,6 +431,12 @@ PMIX_EXPORT pmix_status_t PMIx_Spawn_nb(const pmix_info_t job_info[], size_t nin
     PMIX_RETAIN(fcd->peer);
 
     if (forkexec) {
+        /* run a quick check of the directives to see if any IOF
+         * requests were included so we can set that up now - helps
+         * to catch any early output - and a request for notification
+         * of job termination so we can setup the event registration */
+        pmix_server_spawn_parser(fcd->peer, &fcd->channels, &fcd->flags,
+                                 fcd->info, fcd->ninfo);
         rc = pmix_pfexec_base_spawn_job(fcd);
         if (PMIX_SUCCESS != rc) {
             PMIX_RELEASE(fcd);

@@ -974,6 +974,10 @@ pmix_status_t pmix_iof_process_iof(pmix_iof_channel_t channels, const pmix_proc_
     pmix_buffer_t *msg;
     pmix_status_t rc;
 
+pmix_output(0, "PROCESS IOF");
+TODO: this is where we should format the output and send. Cycle across the request list
+and send if requested
+
     /* if the channel wasn't included, then ignore it */
     if (!(channels & req->channels)) {
         return PMIX_SUCCESS;

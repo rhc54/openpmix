@@ -483,9 +483,8 @@ complete:
         PMIX_ERROR_LOG(PMIX_ERROR);
     }
 
-    /* execute the callback */
-    fcd->spcbfunc(rc, nspace, fcd->cbdata);
-    PMIX_RELEASE(fcd);
+    /* call the server's cbfunc - let it execute the final callback */
+    pmix_server_spcbfunc(rc, nspace, fcd);
     return;
 }
 

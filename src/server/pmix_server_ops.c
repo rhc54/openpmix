@@ -1487,7 +1487,7 @@ pmix_status_t pmix_server_process_iof(pmix_peer_t *peer,
     if (PMIX_FWD_NO_CHANNELS == channels) {
         return PMIX_SUCCESS;
     }
-
+pmix_output(0, "REGISTERING REQ");
     /* record the request */
     req = PMIX_NEW(pmix_iof_req_t);
     if (NULL == req) {
@@ -1515,7 +1515,8 @@ pmix_status_t pmix_server_process_iof(pmix_peer_t *peer,
         if (PMIX_CHECK_NAMES(&iof->source, &req->requestor->info->pname)) {
             continue;
         }
-        pmix_output_verbose(2, pmix_server_globals.iof_output,
+     //   pmix_output_verbose(2, pmix_server_globals.iof_output,
+        pmix_output(0,
                             "PMIX:SERVER:SPAWN delivering cached IOF from %s to %s",
                             PMIX_NAME_PRINT(&iof->source),
                             PMIX_PNAME_PRINT(&req->requestor->info->pname));

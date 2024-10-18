@@ -2729,6 +2729,8 @@ static void _iofdeliver(int sd, short args, void *cbdata)
                         PMIx_IOF_channel_string(cd->channels),
                         (int)cd->bo->size);
 
+TODO: change here - just call process_iof and let it do the loop
+
     /* output it locally if requested */
     rc = pmix_iof_write_output(cd->procs, cd->channels, cd->bo);
     if (0 > rc) {
@@ -4424,6 +4426,8 @@ static void _iofreg(int sd, short args, void *cbdata)
     if (PMIX_SUCCESS != rc) {
         PMIX_RELEASE(reply);
     }
+
+TODO: let process_iof do the loop
 
     /* if the request succeeded, then process any cached IO - doing it here
      * guarantees that the IO will be received AFTER the client gets the
