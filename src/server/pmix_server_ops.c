@@ -1474,9 +1474,8 @@ cleanup:
     return rc;
 }
 
-pmix_status_t pmix_server_process_iof(pmix_peer_t *peer,
-                                      char nspace[],
-                                      pmix_iof_channel_t channels)
+pmix_status_t pmix_server_process_iof(pmix_setup_caddy_t *cd,
+                                      char nspace[])
 {
     pmix_iof_req_t *req;
     pmix_buffer_t *msg;
@@ -1484,7 +1483,7 @@ pmix_status_t pmix_server_process_iof(pmix_peer_t *peer,
     pmix_iof_cache_t *iof, *ionext;
 
     // if no channels to forward, just return success
-    if (PMIX_FWD_NO_CHANNELS == channels) {
+    if (PMIX_FWD_NO_CHANNELS == cd->channels) {
         return PMIX_SUCCESS;
     }
 pmix_output(0, "REGISTERING REQ");
@@ -1493,12 +1492,13 @@ pmix_output(0, "REGISTERING REQ");
     if (NULL == req) {
         return PMIX_ERR_NOMEM;
     }
-    PMIX_RETAIN(peer);
-    req->requestor = peer;
+    PMIX_RETAIN(cd->peer);
+    req->requestor = cd->peer;
     req->nprocs = 1;
     PMIX_PROC_CREATE(req->procs, req->nprocs);
     PMIX_LOAD_PROCID(&req->procs[0], nspace, PMIX_RANK_WILDCARD);
-    req->channels = channels;
+    req->channels = cd->channels;
+    req->flags = cd->flags;
     req->local_id = pmix_pointer_array_add(&pmix_globals.iof_requests, req);
     /* process any cached IO */
     PMIX_LIST_FOREACH_SAFE (iof, ionext, &pmix_server_globals.iof, pmix_iof_cache_t) {
@@ -1561,6 +1561,8 @@ pmix_output(0, "REGISTERING REQ");
                 return rc;
             }
         }
+        // format the message - apply the requested IOF flags
+        
         /* pack the data */
         PMIX_BFROPS_PACK(rc, req->requestor, msg, iof->bo, 1, PMIX_BYTE_OBJECT);
         if (PMIX_SUCCESS != rc) {
@@ -1592,7 +1594,7 @@ void pmix_server_spcbfunc(pmix_status_t status, char nspace[], void *cbdata)
     /* if it was successful, and there are IOF requests, then
      * register them now */
     if (PMIX_SUCCESS == status) {
-        rc = pmix_server_process_iof(cd->peer, nspace, cd->channels);
+        rc = pmix_server_process_iof(cd, nspace);
     }
 
     if (NULL != cd->spcbfunc) {

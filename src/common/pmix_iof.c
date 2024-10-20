@@ -1065,18 +1065,16 @@ and send if requested
     return PMIX_OPERATION_SUCCEEDED;
 }
 
-static pmix_status_t write_output_line(const pmix_proc_t *name,
-                                       pmix_iof_write_event_t *channel,
-                                       pmix_iof_flags_t *myflags,
-                                       pmix_iof_channel_t stream,
-                                       bool copystdout, bool copystderr,
-                                       const pmix_byte_object_t *bo)
+pmix_byte_object_t* pmix_iof_prep_output_line(const pmix_proc_t *name,
+                                              pmix_iof_flags_t *myflags,
+                                              pmix_iof_channel_t stream,
+                                              const pmix_byte_object_t *bo)
 {
     char starttag[PMIX_IOF_BASE_TAG_MAX], endtag[PMIX_IOF_BASE_TAG_MAX], *suffix;
     char timestamp[PMIX_IOF_BASE_TAG_MAX], outtag[PMIX_IOF_BASE_TAG_MAX];
     char begintag[PMIX_IOF_BASE_TAG_MAX];
     char **segments = NULL;
-    pmix_iof_write_output_t *output, *copy;
+    pmix_byte_object_t *output;
     size_t offset, j, n, m, bufsize;
     char *buffer, qprint[15], *cptr;
     const char *usestring;
@@ -1089,7 +1087,7 @@ static pmix_status_t write_output_line(const pmix_proc_t *name,
     pmix_status_t rc;
 
     /* setup output object */
-    output = PMIX_NEW(pmix_iof_write_output_t);
+    output = PMIX_NEW(pmix_byte_object_t);
     memset(begintag, 0, PMIX_IOF_BASE_TAG_MAX);
     memset(starttag, 0, PMIX_IOF_BASE_TAG_MAX);
     memset(endtag, 0, PMIX_IOF_BASE_TAG_MAX);
@@ -1444,8 +1442,25 @@ static pmix_status_t write_output_line(const pmix_proc_t *name,
     if (bufcopy) {
         free(buffer);
     }
+    return PMIX_SUCCESS;
+}
 
-process:
+static pmix_status_t write_output_line(const pmix_proc_t *name,
+                                        pmix_iof_write_event_t *channel,
+                                        pmix_iof_flags_t *myflags,
+                                        pmix_iof_channel_t stream,
+                                        bool copystdout, bool copystderr,
+                                        const pmix_byte_object_t *bo)
+{
+    pmix_status_t rc;
+    pmix_iof_write_output_t *copy;
+
+    rc = pmix_iof_prep_output_line(name, channel, myflags, stream,
+                                   copystdout, copystderr, bo);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+
     /* add this data to the write list for this fd */
     pmix_list_append(&channel->outputs, &output->super);
 
