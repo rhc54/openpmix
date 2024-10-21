@@ -1503,7 +1503,7 @@ pmix_output(0, "REGISTERING REQ");
     /* process any cached IO */
     PMIX_LIST_FOREACH_SAFE (iof, ionext, &pmix_server_globals.iof, pmix_iof_cache_t) {
         /* if the channels don't match, then ignore it */
-        if (!(iof->channel & channels)) {
+        if (!(iof->channel & req->channels)) {
             continue;
         }
         /* if the source does not match the request, then ignore it */
@@ -1606,7 +1606,7 @@ void pmix_server_spcbfunc(pmix_status_t status, char nspace[], void *cbdata)
 void pmix_server_spawn_parser(pmix_peer_t *peer,
                               pmix_iof_channel_t *channels,
                               pmix_iof_flags_t *flags,
-                              pmix_info_t *info,
+                              const pmix_info_t *info,
                               size_t ninfo)
 {
     size_t n;
@@ -3550,6 +3550,12 @@ pmix_status_t pmix_server_iofreg(pmix_peer_t *peer, pmix_buffer_t *buf,
         memcpy(req->procs, cd->procs, req->nprocs * sizeof(pmix_proc_t));
     }
     req->channels = cd->channels;
+    /* run a quick check of the directives to see if any IOF
+     * requests were included so we can set that up now - helps
+     * to catch any early output - and a request for notification
+     * of job termination so we can setup the event registration */
+    pmix_server_spawn_parser(peer, &req->channels, &req->flags,
+                             cd->info, cd->ninfo);
     req->remote_id = refid;
     req->local_id = pmix_pointer_array_add(&pmix_globals.iof_requests, req);
     cd->ncodes = req->local_id;

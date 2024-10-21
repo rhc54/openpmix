@@ -17,7 +17,7 @@
  * Copyright (c) 2017      Mellanox Technologies. All rights reserved.
  * Copyright (c) 2018      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -270,12 +270,16 @@ PMIX_EXPORT void pmix_iof_write_handler(int fd, short event, void *cbdata);
 PMIX_EXPORT bool pmix_iof_stdin_check(int fd);
 PMIX_EXPORT void pmix_iof_read_local_handler(int unusedfd, short event, void *cbdata);
 PMIX_EXPORT void pmix_iof_stdin_cb(int fd, short event, void *cbdata);
+PMIX_EXPORT pmix_byte_object_t* pmix_iof_prep_output(const pmix_proc_t *name,
+                                                     pmix_iof_flags_t *myflags,
+                                                     pmix_iof_channel_t stream,
+                                                     const pmix_byte_object_t *bo);
 PMIX_EXPORT pmix_status_t pmix_iof_process_iof(pmix_iof_channel_t channels,
                                                const pmix_proc_t *source,
                                                const pmix_byte_object_t *bo,
                                                const pmix_info_t *info, size_t ninfo,
-                                               const pmix_iof_req_t *req);
-PMIX_EXPORT void pmix_iof_check_flags(pmix_info_t *info, pmix_iof_flags_t *flags);
+                                               pmix_iof_req_t *req);
+PMIX_EXPORT void pmix_iof_check_flags(const pmix_info_t *info, pmix_iof_flags_t *flags);
 PMIX_EXPORT void pmix_iof_flush_residuals(void);
 
 END_C_DECLS

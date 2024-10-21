@@ -269,6 +269,12 @@ PMIX_EXPORT pmix_status_t PMIx_IOF_pull(const pmix_proc_t procs[], size_t nprocs
         PMIX_PROC_CREATE(req->procs, req->nprocs);
         memcpy(req->procs, procs, nprocs * sizeof(pmix_proc_t));
         req->channels = channel;
+        /* run a quick check of the directives to see if any IOF
+         * requests were included so we can set that up now - helps
+         * to catch any early output - and a request for notification
+         * of job termination so we can setup the event registration */
+        pmix_server_spawn_parser(pmix_globals.mypeer, &req->channels, &req->flags,
+                                 directives, ndirs);
         req->local_id = pmix_pointer_array_add(&pmix_globals.iof_requests, req);
         /* if there is a regsitration callback function, threadshift
          * to call it - we cannot call it before returning from here */
@@ -316,6 +322,12 @@ PMIX_EXPORT pmix_status_t PMIx_IOF_pull(const pmix_proc_t procs[], size_t nprocs
     /* retain the channels and cbfunc */
     req->channels = channel;
     req->cbfunc = cbfunc;
+    /* run a quick check of the directives to see if any IOF
+     * requests were included so we can set that up now - helps
+     * to catch any early output - and a request for notification
+     * of job termination so we can setup the event registration */
+    pmix_server_spawn_parser(pmix_globals.mypeer, &req->channels, &req->flags,
+                             directives, ndirs);
     req->local_id = pmix_pointer_array_add(&pmix_globals.iof_requests, req);
     cd->iofreq = req;
     /* we don't need the source specifications - only the
@@ -910,7 +922,7 @@ static pmix_iof_write_event_t* pmix_iof_setup(pmix_namespace_t *nptr,
     return NULL;
 }
 
-void pmix_iof_check_flags(pmix_info_t *info, pmix_iof_flags_t *flags)
+void pmix_iof_check_flags(const pmix_info_t *info, pmix_iof_flags_t *flags)
 {
     if (PMIX_CHECK_KEY(info, PMIX_IOF_TAG_OUTPUT) ||
         PMIX_CHECK_KEY(info, PMIX_TAG_OUTPUT)) {
@@ -967,16 +979,16 @@ void pmix_iof_check_flags(pmix_info_t *info, pmix_iof_flags_t *flags)
 
 pmix_status_t pmix_iof_process_iof(pmix_iof_channel_t channels, const pmix_proc_t *source,
                                    const pmix_byte_object_t *bo, const pmix_info_t *info,
-                                   size_t ninfo, const pmix_iof_req_t *req)
+                                   size_t ninfo, pmix_iof_req_t *req)
 {
     bool match;
     size_t m;
     pmix_buffer_t *msg;
     pmix_status_t rc;
+    pmix_byte_object_t *wbo;
+    pmix_proc_t proc;
 
 pmix_output(0, "PROCESS IOF");
-TODO: this is where we should format the output and send. Cycle across the request list
-and send if requested
 
     /* if the channel wasn't included, then ignore it */
     if (!(channels & req->channels)) {
@@ -1049,10 +1061,19 @@ and send if requested
             return rc;
         }
     }
+    // process the data based on the request flags
+    PMIX_LOAD_PROCID(&proc, req->requestor->info->pname.nspace, req->requestor->info->pname.rank);
+    wbo = pmix_iof_prep_output(&proc, &req->flags, req->channels, bo);
+    if (NULL == wbo) {
+        PMIX_ERROR_LOG(PMIX_ERR_NOT_SUPPORTED);
+        PMIX_RELEASE(msg);
+        return PMIX_ERR_NOT_SUPPORTED;
+    }
     /* pack the data */
-    PMIX_BFROPS_PACK(rc, req->requestor, msg, bo, 1, PMIX_BYTE_OBJECT);
+    PMIX_BFROPS_PACK(rc, req->requestor, msg, wbo, 1, PMIX_BYTE_OBJECT);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
+        PMIX_RELEASE(wbo);
         PMIX_RELEASE(msg);
         return rc;
     }
@@ -1060,8 +1081,10 @@ and send if requested
     PMIX_PTL_SEND_ONEWAY(rc, req->requestor, msg, PMIX_PTL_TAG_IOF);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
+        PMIX_RELEASE(wbo);
         PMIX_RELEASE(msg);
     }
+    PMIX_RELEASE(wbo);
     return PMIX_OPERATION_SUCCEEDED;
 }
 
@@ -1087,7 +1110,7 @@ pmix_byte_object_t* pmix_iof_prep_output(const pmix_proc_t *name,
     pmix_status_t rc;
 
     /* setup output object */
-    output = PMIX_NEW(pmix_byte_object_t);
+    PMIX_BYTE_OBJECT_CREATE(output, 1);
 
     /* if 0 bytes, then just pass it so the fd can be closed
      * after it writes everything out
@@ -1426,7 +1449,7 @@ pmix_byte_object_t* pmix_iof_prep_output(const pmix_proc_t *name,
         memcpy(&output->bytes[offset], endtag, strlen(endtag));
     }
     if (myflags->xml) {
-        output->bytes[output->numbytes-1] = '\n';
+        output->bytes[output->size-1] = '\n';
     }
     if (bufcopy) {
         free(buffer);

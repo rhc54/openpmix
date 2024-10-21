@@ -2729,8 +2729,6 @@ static void _iofdeliver(int sd, short args, void *cbdata)
                         PMIx_IOF_channel_string(cd->channels),
                         (int)cd->bo->size);
 
-TODO: change here - just call process_iof and let it do the loop
-
     /* output it locally if requested */
     rc = pmix_iof_write_output(cd->procs, cd->channels, cd->bo);
     if (0 > rc) {
@@ -4427,8 +4425,6 @@ static void _iofreg(int sd, short args, void *cbdata)
         PMIX_RELEASE(reply);
     }
 
-TODO: let process_iof do the loop
-
     /* if the request succeeded, then process any cached IO - doing it here
      * guarantees that the IO will be received AFTER the client gets the
      * refid response */
@@ -4438,9 +4434,9 @@ TODO: let process_iof do the loop
                                                              cd->ncodes);
         if (NULL != req) {
             PMIX_LIST_FOREACH_SAFE (iof, inxt, &pmix_server_globals.iof, pmix_iof_cache_t) {
-                if (PMIX_OPERATION_SUCCEEDED
-                    == pmix_iof_process_iof(iof->channel, &iof->source, iof->bo, iof->info,
-                                            iof->ninfo, req)) {
+                rc = pmix_iof_process_iof(iof->channel, &iof->source, iof->bo, iof->info,
+                                          iof->ninfo, req);
+                if (PMIX_OPERATION_SUCCEEDED == rc) {
                     pmix_list_remove_item(&pmix_server_globals.iof, &iof->super);
                     PMIX_RELEASE(iof);
                 }
