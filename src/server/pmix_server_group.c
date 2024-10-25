@@ -110,7 +110,10 @@ static PMIX_CLASS_INSTANCE(grp_block_t,
 
 typedef struct {
     pmix_list_item_t super;
+    pmix_event_t ev;
+    bool event_active;
     pmix_lock_t lock;
+    char *id;
     grp_block_t *blk;
     bool host_called;
     bool local;
