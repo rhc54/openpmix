@@ -1,7 +1,7 @@
 Group Construction
 ==================
 
-PMIx supports two methods for constructing PMIx groups. The
+PMIx supports three methods for constructing PMIx groups. The
 *collective* method is considered the more traditional form
 of the operation but requires all members of the group
 invoking the ``PMIx_Group_construct`` to know the proc ID
@@ -16,6 +16,9 @@ included in the final group. Bootstrap also requires that
 those additional processes know (a) that they need to join
 the group, and (b) the group ID of the group they need
 to join.
+
+Finally, the *invite* method represents the most dynamic form
+of group construction as it is executed in an ad hoc manner.
 
 Each of these methods is explained further below.
 
@@ -44,31 +47,24 @@ has access to posted information.
 
 Bootstrap Method
 ----------------
-Bootstrap is used when the processes involved in group construct do
+Bootstrap is used when the processes leading group construct do
 not know the identity of all other processes that will be participating.
-It is required, however, that all participants at least know how many
-processes will be participating.
+It is required, however, that all leaders at least know how many
+leaders will be participating.
 
-In this context, participants equate to processes that call ``PMIx_Group_construct`` (or
+In this context, "leaders" equate to processes that call ``PMIx_Group_construct`` (or
 its non-blocking equivalent) and pass _only_ their own process identifier
-to the ``procs`` argument. Participants are _required_ to include the
+to the ``procs`` argument. Leaders are _required_ to include the
 ``PMIX_GROUP_BOOTSTRAP`` attribute in their array of ``pmix_info_t``
 directives, with the value in that attribute set to equal the number
-of participants in the group construct operation.
+of leaders in the group construct operation.
 
-
-Add Members
------------
-Additional group members can be specified by any participant via the ``PMIX_GROUP_ADD_MEMBERS``
+Additional group members can be specified by any leader via the ``PMIX_GROUP_ADD_MEMBERS``
 attribute. The PMIx server library and host are jointly responsible for aggregating the
-additional group members specified across participants. Processes that are on the
+additional group members specified across leaders. Processes that are on the
 "additional member" list must call ``PMIx_Group_construct``
 with a ``NULL`` ``procs`` argument - this indicates that the process is to
-be added to the group (via PMIx event, internal to the ``PMIx_Group_construct`` function)
-when the group construct operation has completed.
-
-Participant in this context equates to any process that calls ``PMIx_Group_construct``,
-whether bootstrapping or not.
+be added to the group when the group construct operation has completed.
 
 Note that the group construct operation _cannot_ complete until all "add members" have
 called ``PMIx_Group_construct``. This is required so that any group and/or endpoint information
