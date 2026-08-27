@@ -19,12 +19,27 @@
 # into freed memory. Nothing downstream catches it, which is why this
 # exists.
 #
-# Nothing here is maintained by hand. The set of macros to check is
-# derived from the headers: a macro is "self-naming" when its definition
-# uses its parameter as an object -- "(p)." -- rather than as a type or a
-# class, which is what separates PMIX_LIST_STATIC_INIT(l) from
-# PMIX_OBJ_STATIC_INIT(pmix_object_t). A new one is covered the day it is
-# written.
+# Nothing here is maintained by hand, and there is no list of macros to
+# keep in step. The set is derived two ways, because a tree may use a
+# self-naming initializer it does not define -- PRRTE gets
+# PMIX_LIST_STATIC_INIT from an installed PMIx header, outside anything
+# it can scan:
+#
+#   by definition, when the macro is declared in this tree: its parameter
+#     is used as an object -- "(p)." -- rather than as a type or a class,
+#     which is what separates PMIX_LIST_STATIC_INIT(l) from
+#     PMIX_OBJ_STATIC_INIT(pmix_object_t);
+#
+#   by use, otherwise: the argument names a member ("obj.field") or
+#     repeats the object being initialized ("var = NAME(var)"). A macro
+#     taking a type never looks like either.
+#
+# The second rule is what lets one copy of this script serve both trees.
+# It classifies on the *shape* of the argument, not on whether the
+# argument is correct, so a use that names the wrong object still marks
+# the macro as self-naming and is then caught below. Its only blind spot
+# is a macro whose every use in the tree is wrong, which would have to be
+# introduced that way from the start.
 
 use strict;
 use warnings;
@@ -40,15 +55,19 @@ if (!-d "$top/src") {
     exit 77;    # skip rather than fail: this is not a defect in the tree
 }
 
+# Not every tree has every one of these, and a missing directory is not
+# something to fail over.
+my @roots = grep { -d $_ } ("$top/src", "$top/test", "$top/examples");
 my @files;
-find(sub { push @files, $File::Find::name if (/\.[ch]$/); },
-     "$top/src", "$top/test", "$top/examples");
+find(sub { push @files, $File::Find::name if (/\.[ch]$/); }, @roots) if (@roots);
 @files = sort @files;
 
 # ---------------------------------------------------------------- #
 # 1. which *_STATIC_INIT macros name an object?
 # ---------------------------------------------------------------- #
 my %selfnaming;
+
+# 1a. by definition, for the ones declared here
 foreach my $f (@files) {
     next unless ($f =~ /\.h$/);
     open(my $fh, '<', $f) or next;
@@ -66,6 +85,26 @@ foreach my $f (@files) {
         $selfnaming{$name} = 1 if ($body =~ /\(\s*\Q$param\E\s*\)\s*\./);
     }
 }
+# 1b. by use, for the ones that come from somewhere else
+foreach my $f (@files) {
+    open(my $fh, '<', $f) or next;
+    while (my $line = <$fh>) {
+        # NOTE: capture into lexicals before matching again - a nested
+        # match resets $1..$N, so testing $arg first and reading $2
+        # afterwards silently reads the wrong match.
+        if ($line =~ /\.(\w+)\s*=\s*(\w+_STATIC_INIT)\s*\(\s*(.*?)\s*\)\s*(?=[,;}]|\\?\s*$)/) {
+            my ($macro, $arg) = ($2, $3);
+            $selfnaming{$macro} = 1 if ($arg =~ /\.\w+$/);
+            next;
+        }
+        if ($line =~ /\b(\w+)\s*=\s*(\w+_STATIC_INIT)\s*\(\s*(.*?)\s*\)\s*(?=[,;}]|\\?\s*$)/) {
+            my ($var, $macro, $arg) = ($1, $2, $3);
+            $selfnaming{$macro} = 1 if ($arg eq $var);
+        }
+    }
+    close($fh);
+}
+
 if (!keys %selfnaming) {
     print "check_static_init: found no self-naming initializers to check\n";
     exit 77;
