@@ -3436,7 +3436,12 @@ misbehave by design).
   the length of `nptr->ranks`, so a second entry for a rank pushes that
   list permanently past `nlocalprocs`, `all_registered` is never set, and
   every collective involving the namespace hangs with nothing reporting
-  why. It now says so with `PMIX_ERR_DUPLICATE_KEY` instead.
+  why. A second registration of a rank now **updates** its one entry -
+  uid, gid and `server_object` - which is how a fault-tolerant host
+  re-registers a process it restarts. It refuses
+  (`PMIX_ERR_NOT_SUPPORTED`) a namespace a self-started tool built: see
+  "Who may join a namespace" in
+  [`../mca/ptl/base/AGENTS.md`](../mca/ptl/base/AGENTS.md).
 - **The `nlocalprocs < 0` arm of `_register_nspace` is the *update* path,
   and it has its own rules.** It stores each directive through the gds
   module by hand rather than going through `PMIX_GDS_ADD_NSPACE`. Three

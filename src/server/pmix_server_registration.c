@@ -1641,7 +1641,7 @@ static void _register_client(int sd, short args, void *cbdata)
     bool all_def;
     size_t i;
     pmix_status_t rc;
-    pmix_rank_info_t *adopted;
+    pmix_rank_info_t *existing;
 
     PMIX_ACQUIRE_OBJECT(cd);
     PMIX_HIDE_UNUSED_PARAMS(sd, args);
@@ -1678,6 +1678,15 @@ static void _register_client(int sd, short args, void *cbdata)
         }
         pmix_list_append(&pmix_globals.nspaces, &nptr->super);
     }
+    /* A self-started tool's namespace holds self-started tools and
+     * nothing else - see pmix_namespace_t */
+    if (nptr->self_started) {
+        pmix_output_verbose(2, pmix_server_globals.base_output,
+                            "pmix:server _register_client: %s belongs to a self-started tool",
+                            cd->proc.nspace);
+        rc = PMIX_ERR_NOT_SUPPORTED;
+        goto cleanup;
+    }
     /* Set up a rank entry for this client.
      *
      * At most one entry per rank may exist: the "have we got everyone"
@@ -1687,38 +1696,21 @@ static void _register_client(int sd, short args, void *cbdata)
      * collective involving this namespace hangs with nothing anywhere
      * reporting why.
      *
-     * The host registering a rank we already hold is not automatically
-     * that error, though. A proc that connected before anyone registered
-     * it - a self-started tool, or the singleton case - was given its
-     * entry by the connection handler, and the host registering it
-     * afterwards is the ordinary sequence rather than a mistake. Adopt
-     * the host's description into that entry; only a second *host*
-     * registration is the duplicate worth refusing. */
-    adopted = NULL;
+     * So a rank we already hold is updated rather than added. The host
+     * registering a rank again is an update - a fault-tolerant host
+     * re-registers a process it restarts - and its uid, gid and
+     * server_object are what the rank is from here on. The entry is
+     * shared with any process connected as that rank, so they all see
+     * the update. */
+    existing = NULL;
     PMIX_LIST_FOREACH (info, &nptr->ranks, pmix_rank_info_t) {
-        if (info->pname.rank != cd->proc.rank) {
-            continue;
+        if (info->pname.rank == cd->proc.rank) {
+            existing = info;
+            break;
         }
-        if (info->host_registered) {
-            /* the host really is registering the same rank twice */
-            PMIX_ERROR_LOG(PMIX_ERR_DUPLICATE_KEY);
-            rc = PMIX_ERR_DUPLICATE_KEY;
-            goto cleanup;
-        }
-        /* We made this entry ourselves when the proc connected ahead of
-         * being registered - a self-started tool or singleton. It is the
-         * same rank, so take the host's description of it rather than
-         * adding a second entry: the uid, gid and server_object it
-         * carries are ours only from here, and the server_object in
-         * particular is what every client_connected, client_finalized
-         * and abort upcall hands back to the host to identify the proc.
-         * Refusing this call left those upcalls with NULL and left the
-         * host to recognize its own process some other way. */
-        adopted = info;
-        break;
     }
-    if (NULL != adopted) {
-        info = adopted;
+    if (NULL != existing) {
+        info = existing;
         info->uid = cd->uid;
         info->gid = cd->gid;
         info->server_object = cd->server_object;

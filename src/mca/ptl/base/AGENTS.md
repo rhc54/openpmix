@@ -351,6 +351,54 @@ and put *that* on the list. `test/unit/tool_nspace.c` pins the property
 by driving a real tool connection; note that the entry count alone does
 not catch it, which the test says in a comment.
 
+### Who may join a namespace
+
+A namespace holds one of two kinds of process, never both:
+
+- **Processes the host (or this server) started** - clients and
+  tool-clients. Each was registered before it started: by the host's
+  `PMIx_server_register_client`, or by `pmix_pfexec` when this server
+  fork/execs it. Either way its rank entry has `host_registered` set,
+  and its uid and gid are what anything connecting as that rank must be.
+- **Self-started tools.** The first one's connection builds the
+  namespace (`nptr->self_started`), and its rank entries are made from
+  the identity each tool was validated as.
+
+The connection handler enforces the split:
+
+- A **client** attaches only to a rank with `host_registered` set. psec
+  then holds it to that rank's uid and gid.
+- A **tool-client** (`PMIX_TOOL_CLIENT`/`PMIX_LAUNCHER_CLIENT`) is
+  refused if its namespace or rank is unknown, if the namespace is a
+  self-started tool's, or if the rank was not registered. Otherwise it
+  must match the rank's identity.
+- A **self-started tool** naming an existing namespace may join it only
+  if it is a self-started tool's namespace, and must match its members'
+  identity.
+- `consolidate_nspace()` applies the same rule when the host registers
+  the tool's name during the `tool_connected` upcall. A namespace with no
+  ranks yet - the host's registration of the tool's own job, which is
+  what PRRTE does - is joined and marked `self_started`. One holding
+  ranks is joined only if it is a self-started tool's, as the same user.
+  It decides before it moves anything, and returns NULL to refuse.
+
+"Match an identity" is `identity_matches()`: the same uid, and either
+the same gid or a group that uid belongs to - the rule psec applies to a
+claimed group. It covers a process reconnecting as its rank and a clone
+connecting alongside it; a clone of a tool is held to it as a clone of a
+client is.
+
+A registration lasts until the host deregisters it. A client or tool
+that finalizes and later connects again, with no re-registration in
+between, is checked against the same entry. On the registration side,
+`_register_client` refuses a self-started tool's namespace and treats a
+second registration of a rank as an update. See
+`test/unit/nspace_membership.c`.
+
+**`pmix_list_get_first()` on an empty list returns the list's sentinel,
+not NULL.** Test `pmix_list_get_size()` before taking a namespace's
+first rank entry.
+
 **`_check_cached_events()` in this file is one of three replays of the
 notification hotel, and it is not the one you are likely to be looking
 at.** A newly-connected peer gets whatever it is a target of; so does a
@@ -819,6 +867,7 @@ Two regimes, described in the framework doc. What matters *here*:
 | `test/unit/ptl_stalled_peer.c` | with no timeout, a server keeps servicing requests past an idle, one-byte or partial connection; a connect-ack in pieces is waited for and parsed, an oversized one refused on its header; finalize closes the unfinished ones; the timeout drops them |
 | `test/unit/ptl_recv_timeout.c` | `pmix_ptl_base_recv_blocking` ends a blocking socket's receive at its timeout, and still waits out `EAGAIN` on a non-blocking one |
 | `test/unit/tool_nspace.c` | a real tool connection leaves exactly one namespace object, and the peer resolves through the one on the list |
+| `test/unit/nspace_membership.c` | clients, tool-clients and self-started tools each join only the namespaces they may, as the identity registered for them; the host's registration of a client into a self-started tool's namespace is refused and a repeat registration updates |
 | `test/unit/tool_cycle.c`, `client_cycle.c` | repeated connect/finalize cycles through this code |
 | `contrib/dockerswarm/run-ptl-tests.sh` | the paths a single node cannot reach: tools connecting across nodes, discovery by pid/nspace, remote-connection interface selection |
 

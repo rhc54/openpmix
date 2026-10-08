@@ -423,6 +423,13 @@ typedef struct {
     bool local_app_fini_fired; // the "all local processes finalized" callback has been
                                // fired for this nspace; guards against re-firing it once
                                // per rank while the nspace is torn down
+    /* The job of a self-started tool, built by that tool's connection.
+     * A namespace holds either self-started tools or processes the host
+     * (or this server) started - clients and tool-clients - never both,
+     * so only a self-started tool may join one marked this way, and
+     * only the host's registration of a client or tool-client may add
+     * a rank to one that is not */
+    bool self_started;
     pmix_list_t ranks;     // list of pmix_rank_info_t for connection support of my clients
     /* Ranks whose entry above the host has taken back - the proc has
      * terminated. pmix_proclist_t, one per reaped LOCAL rank, kept until
@@ -507,17 +514,13 @@ typedef struct pmix_rank_info_t {
     bool modex_recvd;
     int proc_cnt;        // #clones of this rank we know about
     void *server_object; // pointer to rank-specific object provided by server
-    /* True once the host has registered this rank with
-     * PMIx_server_register_client.
-     *
-     * A rank normally reaches our list that way and no other, but a
-     * self-started tool - a singleton being the common case - connects
-     * before any host knows to register it, so the connection handler
-     * creates its entry itself. The host may then legitimately register
-     * that same rank, and it is the only one that can tell us the uid,
-     * gid and server_object the entry is missing. Without this flag the
-     * two cases are indistinguishable and the second one has to be
-     * refused, which drops what the host was trying to give us. */
+    /* True when the rank was registered before its process started:
+     * by the host with PMIx_server_register_client, or by this server
+     * when it fork/execs the process itself. Its uid and gid are then
+     * what any process connecting as this rank - the process itself or
+     * a clone of it - must be. Every other entry belongs to a
+     * self-started tool, made by the connection handler from the
+     * identity the tool was validated as. */
     bool host_registered;
     /* Modex bookkeeping, server side - see pmix_server_collect_data.
      *

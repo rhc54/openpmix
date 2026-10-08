@@ -120,11 +120,9 @@ result directly:
   registration.
 * ``PMIX_ERR_BAD_PARAM`` |mdash| ``proc`` is ``NULL`` or names an empty
   namespace.
-* ``PMIX_ERR_DUPLICATE_KEY`` |mdash| a client with this namespace and rank has
-  already been registered. The host is required to call this function exactly
-  once per rank; a second call would push the namespace's rank list permanently
-  past its local-process count, after which every collective involving the
-  namespace would hang.
+* ``PMIX_ERR_NOT_SUPPORTED`` |mdash| the namespace belongs to a self-started
+  tool. A namespace holds either processes the host started (clients and
+  tool-clients) or self-started tools, never both.
 * ``PMIX_ERR_WOULD_BLOCK`` |mdash| the blocking form was called from the
   library's own progress thread. See `PROGRESS THREAD RESTRICTION`_.
 
@@ -147,9 +145,24 @@ of an eventual
 After registering the client, the host must call ``PMIx_server_setup_fork`` to
 inject the environment the client needs to connect back to this server.
 
-For security, PMIx server implementations should verify the user and group IDs
-of a connecting process against those registered here before completing the
-connection.
+Registering a rank that is already registered updates it: the new ``uid``,
+``gid`` and ``server_object`` replace the old ones. A host uses this to
+re-register a process it restarts.
+
+A registration lasts until the host calls
+:ref:`PMIx_server_deregister_client(3) <man3-PMIx_server_deregister_client>` or
+:ref:`PMIx_server_deregister_nspace(3) <man3-PMIx_server_deregister_nspace>`
+|mdash| a client that finalizes, or exits, does not end it. Any process that
+connects as this namespace and rank while it lasts |mdash| the client itself,
+the same client connecting again, or a clone it starts |mdash| must have the
+registered user ID and the registered group ID (or one that user belongs to).
+A host that restarts a client as a new process, possibly as a different user,
+must therefore re-register it before starting it.
+
+A tool the host starts (a tool-client) is registered with this function in the
+same way, and is held to the same identity when it calls
+:ref:`PMIx_tool_init(3) <man3-PMIx_tool_init>`. A process that was not
+registered cannot connect as a client or tool-client.
 
 
 .. include:: /man/no-blocking-in-progress-thread.rst
