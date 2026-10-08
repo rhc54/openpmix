@@ -2208,7 +2208,17 @@ never learn it left, so `pmix_server_tool_departed` retires its peer at
 once and removes its rank entry and namespace when no connected process
 holds them. `release_nspace` is the teardown that shares with
 `_deregister_nspace`. See "Who may join a namespace" in
-[`../mca/ptl/base/AGENTS.md`](../mca/ptl/base/AGENTS.md). `pmix_server_purge_events`
+[`../mca/ptl/base/AGENTS.md`](../mca/ptl/base/AGENTS.md).
+
+**Deregistration closes every connection on what it removes.**
+`remove_client` retires the peer at `info->peerid`, and `close_clones`
+first closes every other peer on the rank (or, for a namespace, on the
+namespace): clones and older instances. The host deregisters what it
+started once that has ended, but it never started the clones and may not
+know of them; nothing on the namespace is served afterwards, so they are
+closed, tools exactly as clients. A clone that finalized gives back its
+finalized count, so `nfinalized` counts only the rank's own peer.
+`pmix_server_purge_events`
 scrubs a departing peer from the event-registration store and pending
 notifications.
 

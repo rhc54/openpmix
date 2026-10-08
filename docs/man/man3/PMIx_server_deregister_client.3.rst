@@ -57,6 +57,11 @@ disconnected. ``PMIx_server_deregister_client`` is therefore needed only when a
 single client must be removed while its namespace remains active |mdash| though
 it may be called in non-exception cases if desired.
 
+Every connection the server holds for the client is closed, including any
+clone |mdash| a process the client started itself that connected as the same
+rank. The host did not start a clone and may not know of it, but nothing is
+served for the client once it is deregistered.
+
 Like other server registration APIs, this call thread-shifts the request onto
 the library's internal progress thread and supports both a non-blocking and a
 blocking mode, selected by the ``cbfunc`` argument:

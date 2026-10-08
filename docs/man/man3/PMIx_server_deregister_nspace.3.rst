@@ -52,6 +52,12 @@ intended to support persistent PMIx servers by giving the host resource manager
 an opportunity to tell the PMIx server library to release all memory associated
 with a completed job.
 
+Every connection the server holds on the namespace is closed, including any
+clone |mdash| a process a client started itself that connected as that
+client's rank. The host did not start a clone and may not know of it, but
+nothing on the namespace is served once it is deregistered. Tools on the
+namespace are treated exactly as clients.
+
 Like :ref:`PMIx_server_register_nspace(3) <man3-PMIx_server_register_nspace>`,
 this call thread-shifts the request onto the library's internal progress
 thread, where the purge is actually performed. It supports both a non-blocking

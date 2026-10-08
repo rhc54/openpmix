@@ -23,7 +23,9 @@
  *    start them and may never hear they went. A tool that comes back
  *    builds them again;
  *  - the host may not register a client into a self-started tool's
- *    namespace, and registering a rank it already registered updates it.
+ *    namespace, and registering a rank it already registered updates it;
+ *  - deregistering a rank or a namespace closes every connection on it,
+ *    clones included.
  *
  * The server runs here; every connecting process is this binary re-exec'd
  * with a role, so it starts with an uninitialized library. A child
@@ -58,6 +60,7 @@ extern char **environ;
 #define NSM_FRESH "nsm.fresh"  // a tool's job the host registers during the upcall
 #define NSM_LOST  "nsm.lost"   // a self-started tool's job, left without finalizing
 #define NSM_GONE  "nsm.gone"   // a self-started tool's job, deregistered during an upcall
+#define NSM_DEREG "nsm.dereg"  // a job the host deregisters with clones still on it
 
 /* child exit statuses */
 #define CHILD_CONNECTED 0
@@ -377,7 +380,7 @@ typedef struct {
     int go;
 } held_t;
 
-static bool hold(const char *nspace, const char *rank, held_t *h)
+static bool hold_as(const char *nspace, const char *rank, bool tool_client, held_t *h)
 {
     int ready[2], go[2];
     char *more[3] = {NULL, NULL, NULL};
@@ -398,7 +401,7 @@ static bool hold(const char *nspace, const char *rank, held_t *h)
     fcntl(go[1], F_SETFD, FD_CLOEXEC);
     pmix_asprintf(&more[0], "NSM_READYFD=%d", ready[1]);
     pmix_asprintf(&more[1], "NSM_GOFD=%d", go[0]);
-    env = tool_env(nspace, rank, false, more);
+    env = tool_env(nspace, rank, tool_client, more);
     free(more[0]);
     free(more[1]);
     h->pid = launch("tool", env);
@@ -408,6 +411,11 @@ static bool hold(const char *nspace, const char *rank, held_t *h)
     h->ready = ready[0];
     h->go = go[1];
     return (1 == read(h->ready, &c, 1));
+}
+
+static bool hold(const char *nspace, const char *rank, held_t *h)
+{
+    return hold_as(nspace, rank, false, h);
 }
 
 static int let_go(held_t *h)
@@ -512,6 +520,46 @@ static bool wait_rank_gone(const char *nspace, pmix_rank_t rank)
         usleep(10000);
     }
     return false;
+}
+
+/* how many connected peers the server holds under this namespace's name,
+ * whether or not the namespace is still listed */
+typedef struct {
+    pmix_event_t ev;
+    pmix_lock_t lock;
+    const char *nspace;
+    size_t count;
+} named_t;
+
+static void named_fn(int sd, short args, void *cbdata)
+{
+    named_t *q = (named_t *) cbdata;
+    pmix_peer_t *peer;
+    int i;
+
+    (void) sd;
+    (void) args;
+    for (i = 0; i < pmix_server_globals.clients.size; i++) {
+        peer = (pmix_peer_t *) pmix_pointer_array_get_item(&pmix_server_globals.clients, i);
+        if (NULL != peer && NULL != peer->info && 0 <= peer->sd &&
+            0 == strncmp(peer->info->pname.nspace, q->nspace, PMIX_MAX_NSLEN)) {
+            ++q->count;
+        }
+    }
+    PMIX_WAKEUP_THREAD(&q->lock);
+}
+
+static size_t connected_as(const char *nspace)
+{
+    named_t q;
+
+    memset(&q, 0, sizeof(q));
+    PMIX_CONSTRUCT_LOCK(&q.lock);
+    q.nspace = nspace;
+    PMIX_THREADSHIFT(&q, named_fn);
+    PMIX_WAIT_THREAD(&q.lock);
+    PMIX_DESTRUCT_LOCK(&q.lock);
+    return q.count;
 }
 
 static pmix_namespace_t *find_nspace(const char *nspace)
@@ -657,6 +705,56 @@ static void vanished_case(void)
     report("that namespace goes too", wait_gone(NSM_GONE));
 }
 
+/* wait for an operation that answers through opcb */
+static pmix_status_t await(pmix_status_t rc, volatile pmix_status_t *st)
+{
+    int n;
+
+    for (n = 0; PMIX_SUCCESS == rc && n < 1000 && PMIX_ERR_NOT_AVAILABLE + 1000 == *st; n++) {
+        usleep(10000);
+    }
+    return (PMIX_SUCCESS == rc) ? *st : rc;
+}
+
+/* The host deregisters a rank, then a namespace, while a clone of the
+ * rank is still connected. Both connections close. */
+static void dereg_cases(void)
+{
+    held_t h1, h2;
+    pmix_nspace_t job;
+    pmix_proc_t proc;
+    volatile pmix_status_t st;
+    bool ok;
+
+    st = PMIX_ERR_NOT_AVAILABLE + 1000;
+    PMIX_LOAD_NSPACE(job, NSM_DEREG);
+    ok = PMIX_SUCCESS == await(PMIx_server_register_nspace(job, 1, NULL, 0, opcb, (void *) &st), &st) &&
+         PMIX_SUCCESS == register_client(NSM_DEREG, 0, getuid(), getgid());
+    ok = ok && hold_as(NSM_DEREG, "0", true, &h1);
+    ok = ok && hold_as(NSM_DEREG, "0", true, &h2);
+    report("a rank and its clone connect", ok && 2 == connected_as(NSM_DEREG));
+    PMIX_LOAD_PROCID(&proc, NSM_DEREG, 0);
+    st = PMIX_ERR_NOT_AVAILABLE + 1000;
+    PMIx_server_deregister_client(&proc, opcb, (void *) &st);
+    (void) await(PMIX_SUCCESS, &st);
+    report("deregistering the rank closes both connections", 0 == connected_as(NSM_DEREG));
+    /* the server dropped them, so how they exit is not asked */
+    (void) let_go(&h1);
+    (void) let_go(&h2);
+
+    ok = PMIX_SUCCESS == register_client(NSM_DEREG, 0, getuid(), getgid());
+    ok = ok && hold_as(NSM_DEREG, "0", true, &h1);
+    ok = ok && hold_as(NSM_DEREG, "0", true, &h2);
+    report("the rank and a clone connect again", ok && 2 == connected_as(NSM_DEREG));
+    st = PMIX_ERR_NOT_AVAILABLE + 1000;
+    PMIx_server_deregister_nspace(job, opcb, (void *) &st);
+    (void) await(PMIX_SUCCESS, &st);
+    report("deregistering the namespace closes both connections",
+           0 == connected_as(NSM_DEREG) && NULL == find_nspace(NSM_DEREG));
+    (void) let_go(&h1);
+    (void) let_go(&h2);
+}
+
 int main(int argc, char **argv)
 {
     pmix_status_t rc;
@@ -748,6 +846,7 @@ int main(int argc, char **argv)
            wait_gone(NSM_FRESH));
 
     vanished_case();
+    dereg_cases();
 
     /* registering a rank again updates it */
     report("registering a rank again succeeds",

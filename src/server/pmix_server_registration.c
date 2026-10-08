@@ -948,18 +948,116 @@ void pmix_server_peer_finalized(pmix_peer_t *peer)
     PMIX_RELEASE(peer);
 }
 
+/* Close a peer the host is retiring and drop the clients array's
+ * reference to it. "slot" is the peer's place in that array. */
+static void close_peer(pmix_peer_t *peer, int slot)
+{
+    /* honor any registered epilogs */
+    pmix_execute_epilog(&peer->epilog);
+    /* Push out anything still queued for this peer before its
+     * socket goes away.  We are retiring a peer the host has
+     * told us about, not reacting to one that vanished, so a
+     * message sitting on its send queue is one we accepted the
+     * obligation to deliver - typically the reply to the very
+     * finalize that brought the host here, which reaches the
+     * peer only when its send event next fires and so is still
+     * unwritten at this point.  Dropping it leaves the peer
+     * waiting on an answer that was packed and discarded, and
+     * on the finalize path that wait is the full guard timer in
+     * PMIx_Finalize/PMIx_tool_finalize. */
+    pmix_ptl_base_flush_sends(peer);
+    /* Take the peer's events off the base before its socket
+     * goes, never after.
+     *
+     * libevent issues epoll_ctl() only when the interest it
+     * holds in a descriptor NUMBER changes, and the kernel drops
+     * a registration by itself when the descriptor is closed.
+     * Closing first therefore leaves libevent believing this fd
+     * number is still watched. The deletes do follow - in the
+     * destructor, whenever the last reference to the peer goes -
+     * but by then accept() may have handed the same number to a
+     * new client. Adding that client's read event raises an
+     * interest libevent thinks is already registered, so no
+     * EPOLL_CTL_ADD is ever made for it; and the late delete,
+     * aimed at a number now held by a different socket, can
+     * remove that socket's registration instead. Either way the
+     * new client's connect-ack is never read, the listener drops
+     * the connection when ptl_base_connect_ack_timeout expires,
+     * and the client - handed an EOF where a status should be -
+     * comes up as a singleton with none of its job data.
+     *
+     * Under a spawn-heavy workload, where clients connect and
+     * finalize continuously and descriptor numbers are reused
+     * within milliseconds, that happened often enough to fail
+     * the mpi4py spawn tests in CI: the orphaned rank computed
+     * no locality for its peers, so Open MPI's TCP BTL
+     * discarded their same-node addresses and MPI_Init died with
+     * "Unable to find reachable pairing". */
+    if (peer->recv_ev_active) {
+        pmix_event_del(&peer->recv_event);
+        peer->recv_ev_active = false;
+    }
+    if (peer->send_ev_active) {
+        pmix_event_del(&peer->send_event);
+        peer->send_ev_active = false;
+    }
+    /* ensure we close the socket to this peer so we don't
+     * generate "connection lost" events should it be
+     * subsequently "killed" by the host */
+    CLOSE_THE_SOCKET(peer->sd);
+    // remove it from our client array
+    pmix_pointer_array_set_item(&pmix_server_globals.clients, slot, NULL);
+    PMIX_RELEASE(peer);
+}
+
+/* Close every connection on this namespace - or on one rank of it - other
+ * than the rank's own peer, which remove_client handles. These are clones
+ * and older instances of the rank. The host deregisters what it started
+ * once that has ended, and nothing on the namespace is served after that,
+ * so they go with it. A clone that finalized still holds a finalized
+ * count; drop it so only the rank's own peer is counted. */
+static void close_clones(pmix_namespace_t *nptr, pmix_rank_info_t *info)
+{
+    pmix_peer_t *pr;
+    int n;
+
+    for (n = 0; n < pmix_server_globals.clients.size; n++) {
+        pr = (pmix_peer_t *) pmix_pointer_array_get_item(&pmix_server_globals.clients, n);
+        if (NULL == pr || pr->nptr != nptr || NULL == pr->info ||
+            (NULL != info && pr->info != info) ||
+            n == pr->info->peerid) {
+            continue;
+        }
+        if (pr->finalized) {
+            if (0 < nptr->nfinalized) {
+                --nptr->nfinalized;
+            }
+        } else {
+            pr->finalized = true;
+        }
+        if (!PMIX_PEER_IS_TOOL(pr)) {
+            pmix_psensor.stop(pr, NULL);
+        }
+        close_peer(pr, n);
+    }
+}
+
 static void remove_client(pmix_namespace_t *nptr, pmix_proc_t *p)
 {
     pmix_rank_info_t *info, *inext;
     pmix_peer_t *peer;
     pmix_proc_t proc;
 
+    if (NULL == p) {
+        close_clones(nptr, NULL);
+    }
     PMIX_LIST_FOREACH_SAFE(info, inext, &nptr->ranks, pmix_rank_info_t) {
         if (NULL == p || info->pname.rank == p->rank) {
             if (NULL == p) {
                 PMIX_LOAD_PROCID(&proc, info->pname.nspace, info->pname.rank);
             } else {
                 memcpy(&proc, p, sizeof(pmix_proc_t));
+                close_clones(nptr, info);
             }
             /* if this client failed to call finalize, we still need
              * to restore any allocations that were given to it */
@@ -993,62 +1091,7 @@ static void remove_client(pmix_namespace_t *nptr, pmix_proc_t *p)
                     pmix_pgpu.child_finalized(&proc);
                     pmix_psensor.stop(peer, NULL);
                 }
-                /* honor any registered epilogs */
-                pmix_execute_epilog(&peer->epilog);
-                /* Push out anything still queued for this peer before its
-                 * socket goes away.  We are retiring a peer the host has
-                 * told us about, not reacting to one that vanished, so a
-                 * message sitting on its send queue is one we accepted the
-                 * obligation to deliver - typically the reply to the very
-                 * finalize that brought the host here, which reaches the
-                 * peer only when its send event next fires and so is still
-                 * unwritten at this point.  Dropping it leaves the peer
-                 * waiting on an answer that was packed and discarded, and
-                 * on the finalize path that wait is the full guard timer in
-                 * PMIx_Finalize/PMIx_tool_finalize. */
-                pmix_ptl_base_flush_sends(peer);
-                /* Take the peer's events off the base before its socket
-                 * goes, never after.
-                 *
-                 * libevent issues epoll_ctl() only when the interest it
-                 * holds in a descriptor NUMBER changes, and the kernel drops
-                 * a registration by itself when the descriptor is closed.
-                 * Closing first therefore leaves libevent believing this fd
-                 * number is still watched. The deletes do follow - in the
-                 * destructor, whenever the last reference to the peer goes -
-                 * but by then accept() may have handed the same number to a
-                 * new client. Adding that client's read event raises an
-                 * interest libevent thinks is already registered, so no
-                 * EPOLL_CTL_ADD is ever made for it; and the late delete,
-                 * aimed at a number now held by a different socket, can
-                 * remove that socket's registration instead. Either way the
-                 * new client's connect-ack is never read, the listener drops
-                 * the connection when ptl_base_connect_ack_timeout expires,
-                 * and the client - handed an EOF where a status should be -
-                 * comes up as a singleton with none of its job data.
-                 *
-                 * Under a spawn-heavy workload, where clients connect and
-                 * finalize continuously and descriptor numbers are reused
-                 * within milliseconds, that happened often enough to fail
-                 * the mpi4py spawn tests in CI: the orphaned rank computed
-                 * no locality for its peers, so Open MPI's TCP BTL
-                 * discarded their same-node addresses and MPI_Init died with
-                 * "Unable to find reachable pairing". */
-                if (peer->recv_ev_active) {
-                    pmix_event_del(&peer->recv_event);
-                    peer->recv_ev_active = false;
-                }
-                if (peer->send_ev_active) {
-                    pmix_event_del(&peer->send_event);
-                    peer->send_ev_active = false;
-                }
-                /* ensure we close the socket to this peer so we don't
-                 * generate "connection lost" events should it be
-                 * subsequently "killed" by the host */
-                CLOSE_THE_SOCKET(peer->sd);
-                // remove it from our client array
-                pmix_pointer_array_set_item(&pmix_server_globals.clients, info->peerid, NULL);
-                PMIX_RELEASE(peer);
+                close_peer(peer, info->peerid);
             }
             /* Fire the "all local processes finalized" callback exactly
              * once. In the tombstone model a finalized peer stays counted in
