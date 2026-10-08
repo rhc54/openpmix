@@ -523,7 +523,8 @@ void pmix_ptl_base_connection_handler(int sd, short args, void *cbdata)
          * separately - it is a 2-step procedure */
         rc = process_tool_request(pnd, blob, len);
         if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
+            /* a refusal is an answer, not an error - it is logged
+             * verbosely where it is made, and a failure where it fails */
             goto error;
         }
         if (NULL != blob) {
@@ -1402,12 +1403,18 @@ static pmix_status_t process_tool_request(pmix_pending_connection_t *pnd,
      * a credential knows to expect it. */
     psec = pmix_psec_base_assign_module(pnd->psec);
     if (NULL == psec) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "tool asked for security module %s, which is not available",
+                            (NULL == pnd->psec) ? "NULL" : pnd->psec);
         return PMIX_ERR_NOT_SUPPORTED;
     }
     pnd->psecmod = psec;
     if (NULL == psec->validate_cred) {
         /* every psec module validates a credential - one that cannot is
          * not a security mechanism */
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "security module %s cannot validate a tool's credential",
+                            psec->name);
         u32 = htonl((uint32_t) PMIX_ERR_NOT_SUPPORTED);
         (void) pmix_ptl_base_send_blocking(pnd->sd, (char *) &u32, sizeof(uint32_t));
         return PMIX_ERR_NOT_SUPPORTED;
@@ -1421,6 +1428,7 @@ static pmix_status_t process_tool_request(pmix_pending_connection_t *pnd,
         if (NULL != vinfo) {
             PMIX_RELEASE(vinfo);
         }
+        PMIX_ERROR_LOG(PMIX_ERR_NOMEM);
         return PMIX_ERR_NOMEM;
     }
     vinfo->pname.nspace = strdup(pnd->proc.nspace);
@@ -1473,6 +1481,9 @@ static pmix_status_t process_tool_request(pmix_pending_connection_t *pnd,
     if (!pmix_ptl_base.allow_foreign_tools) {
         if (pnd->uid != pmix_globals.uid) {
             // reject this connection
+            pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                                "tool of user %u refused: tools of other users are not allowed",
+                                (unsigned) pnd->uid);
             return PMIX_ERR_NOT_SUPPORTED;
         }
     }
@@ -1651,6 +1662,8 @@ static pmix_status_t process_tool_request(pmix_pending_connection_t *pnd,
             /* we need someone to provide the tool with an
              * identifier and they aren't available */
             /* send an error reply to the client */
+            pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                                "tool needs an identity and the host cannot assign one");
             rc = PMIX_ERR_NOT_SUPPORTED;
             goto cleanup;
         } else {
@@ -1702,6 +1715,8 @@ static pmix_status_t process_tool_request(pmix_pending_connection_t *pnd,
     if (NULL != pmix_host_server.tool_connected2) {
         rc = pmix_host_server.tool_connected2(pnd->info, pnd->ninfo, cnct_cbfunc, pnd);
         if (PMIX_SUCCESS != rc) {
+            pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                                "host refused the tool: %s", PMIx_Error_string(rc));
             goto cleanup;
         }
         return PMIX_SUCCESS;
