@@ -17,7 +17,11 @@
  *    identity they were registered with. A second process connecting as
  *    the same rank - a clone - is held to the same identity;
  *  - a self-started tool builds its own namespace, and may join only a
- *    namespace another self-started tool built, as the same user;
+ *    namespace another self-started tool built, as the same user. The
+ *    server drops a rank no connected process holds, and the namespace
+ *    once none is left in it, however its tools left - the host did not
+ *    start them and may never hear they went. A tool that comes back
+ *    builds them again;
  *  - the host may not register a client into a self-started tool's
  *    namespace, and registering a rank it already registered updates it.
  *
@@ -38,6 +42,7 @@
 #include "src/util/pmix_printf.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +56,8 @@ extern char **environ;
 #define NSM_NONE  "nsm.none"   // a job nobody registered
 #define NSM_SELF  "nsm.self"   // a self-started tool's job
 #define NSM_FRESH "nsm.fresh"  // a tool's job the host registers during the upcall
+#define NSM_LOST  "nsm.lost"   // a self-started tool's job, left without finalizing
+#define NSM_GONE  "nsm.gone"   // a self-started tool's job, deregistered during an upcall
 
 /* child exit statuses */
 #define CHILD_CONNECTED 0
@@ -77,7 +84,8 @@ static void report(const char *name, int passed)
 /* Connect as a tool. The environment decides what kind: PMIX_NAMESPACE
  * and PMIX_RANK make it a tool-client, NSM_NSPACE/NSM_RANK a self-started
  * tool with an identity of its own, and neither one that asks for one.
- * With NSM_READYFD/NSM_GOFD it stays connected until told to go. */
+ * With NSM_READYFD/NSM_GOFD it stays connected until told to go, and with
+ * NSM_NOFINAL it exits without finalizing. */
 static int run_tool(void)
 {
     pmix_proc_t me;
@@ -107,6 +115,9 @@ static int run_tool(void)
     }
     if (PMIX_SUCCESS != rc) {
         return CHILD_REFUSED;
+    }
+    if (NULL != getenv("NSM_NOFINAL")) {
+        _exit(CHILD_CONNECTED);
     }
     rfd = getenv("NSM_READYFD");
     gfd = getenv("NSM_GOFD");
@@ -142,10 +153,24 @@ static enum {
     ASSIGN_FRESH     // a name the host registers for the tool, as PRRTE does
 } assign = ASSIGN_JOB;
 
+/* a tool naming this namespace has it deregistered while the host
+ * decides on the tool */
+static const char *volatile dereg_in_upcall = NULL;
+
 typedef struct {
     pmix_tool_connection_cbfunc_t cbfunc;
     void *cbdata;
+    pmix_proc_t proc;
 } upcall_t;
+
+static void dereg_done(pmix_status_t status, void *cbdata)
+{
+    upcall_t *up = (upcall_t *) cbdata;
+
+    (void) status;
+    up->cbfunc(PMIX_SUCCESS, &up->proc, up->cbdata);
+    free(up);
+}
 
 static void fresh_registered(pmix_status_t status, void *cbdata)
 {
@@ -176,6 +201,14 @@ static void tool_connected_fn(pmix_info_t *info, size_t ninfo,
             proc.rank = info[n].value.data.rank;
         }
     }
+    if (have_ns && NULL != dereg_in_upcall && PMIX_CHECK_NSPACE(proc.nspace, dereg_in_upcall)) {
+        up = (upcall_t *) malloc(sizeof(upcall_t));
+        up->cbfunc = cbfunc;
+        up->cbdata = cbdata;
+        up->proc = proc;
+        PMIx_server_deregister_nspace(proc.nspace, dereg_done, up);
+        return;
+    }
     if (have_ns) {
         cbfunc(PMIX_SUCCESS, &proc, cbdata);
         return;
@@ -195,6 +228,39 @@ static void tool_connected_fn(pmix_info_t *info, size_t ninfo,
         free(up);
         cbfunc(rc, NULL, cbdata);
     }
+}
+
+/* the host's handler for a lost connection: notes that a tool of
+ * NSM_LOST was reported gone */
+static volatile int lost_seen = 0;
+
+static void lost_fn(size_t id, pmix_status_t status, const pmix_proc_t *source,
+                    pmix_info_t info[], size_t ninfo, pmix_info_t results[],
+                    size_t nresults, pmix_event_notification_cbfunc_fn_t cbfunc,
+                    void *cbdata)
+{
+    (void) id;
+    (void) status;
+    (void) info;
+    (void) ninfo;
+    (void) results;
+    (void) nresults;
+    if (NULL != source && 0 == strncmp(source->nspace, NSM_LOST, PMIX_MAX_NSLEN)) {
+        lost_seen = 1;
+    }
+    if (NULL != cbfunc) {
+        cbfunc(PMIX_EVENT_ACTION_COMPLETE, NULL, 0, NULL, NULL, cbdata);
+    }
+}
+
+static bool wait_lost(void)
+{
+    int n;
+
+    for (n = 0; n < 1000 && !lost_seen; n++) {
+        usleep(10000);
+    }
+    return (0 != lost_seen);
 }
 
 static pmix_server_module_t mymodule = {
@@ -253,12 +319,12 @@ static int reap(pid_t child)
     return WEXITSTATUS(status);
 }
 
-/* run a tool to completion and return its exit status */
-static int tool(const char *nspace, const char *rank, bool tool_client)
+/* the environment of a tool: NULL nspace asks for an identity */
+static char **tool_env(const char *nspace, const char *rank, bool tool_client, char **more)
 {
     char **extra = NULL, **env;
     char *tmp;
-    int rc;
+    size_t n;
 
     pmix_asprintf(&tmp, "NSM_URI=%s", server_uri);
     PMIx_Argv_append_nosize(&extra, tmp);
@@ -271,11 +337,181 @@ static int tool(const char *nspace, const char *rank, bool tool_client)
         PMIx_Argv_append_nosize(&extra, tmp);
         free(tmp);
     }
+    for (n = 0; NULL != more && NULL != more[n]; n++) {
+        PMIx_Argv_append_nosize(&extra, more[n]);
+    }
     env = child_env(extra);
-    rc = reap(launch("tool", env));
     PMIx_Argv_free(extra);
+    return env;
+}
+
+/* run a tool to completion and return its exit status */
+static int tool(const char *nspace, const char *rank, bool tool_client)
+{
+    char **env;
+    int rc;
+
+    env = tool_env(nspace, rank, tool_client, NULL);
+    rc = reap(launch("tool", env));
     PMIx_Argv_free(env);
     return rc;
+}
+
+/* run a self-started tool that exits without finalizing */
+static int tool_nofinal(const char *nspace, const char *rank)
+{
+    char *more[] = {"NSM_NOFINAL=1", NULL};
+    char **env;
+    int rc;
+
+    env = tool_env(nspace, rank, false, more);
+    rc = reap(launch("tool", env));
+    PMIx_Argv_free(env);
+    return rc;
+}
+
+/* a self-started tool held connected until let go */
+typedef struct {
+    pid_t pid;
+    int ready;
+    int go;
+} held_t;
+
+static bool hold(const char *nspace, const char *rank, held_t *h)
+{
+    int ready[2], go[2];
+    char *more[3] = {NULL, NULL, NULL};
+    char **env, c;
+
+    h->pid = -1;
+    h->ready = -1;
+    h->go = -1;
+    if (0 != pipe(ready)) {
+        return false;
+    }
+    if (0 != pipe(go)) {
+        close(ready[0]);
+        close(ready[1]);
+        return false;
+    }
+    fcntl(ready[0], F_SETFD, FD_CLOEXEC);
+    fcntl(go[1], F_SETFD, FD_CLOEXEC);
+    pmix_asprintf(&more[0], "NSM_READYFD=%d", ready[1]);
+    pmix_asprintf(&more[1], "NSM_GOFD=%d", go[0]);
+    env = tool_env(nspace, rank, false, more);
+    free(more[0]);
+    free(more[1]);
+    h->pid = launch("tool", env);
+    PMIx_Argv_free(env);
+    close(ready[1]);
+    close(go[0]);
+    h->ready = ready[0];
+    h->go = go[1];
+    return (1 == read(h->ready, &c, 1));
+}
+
+static int let_go(held_t *h)
+{
+    char c = 'g';
+
+    if (1 != write(h->go, &c, 1)) {
+        /* it is gone already */
+    }
+    close(h->go);
+    close(h->ready);
+    return reap(h->pid);
+}
+
+/* What the server holds for a namespace, read on its progress thread:
+ * whether the namespace is listed, whether a self-started tool's, how
+ * many entries it has for a rank, and how many connected peers are on
+ * it. */
+typedef struct {
+    pmix_event_t ev;
+    pmix_lock_t lock;
+    const char *nspace;
+    pmix_rank_t rank;
+    bool listed;
+    bool self_started;
+    size_t nranks;
+    size_t nconnected;
+} probe_t;
+
+static void probe_fn(int sd, short args, void *cbdata)
+{
+    probe_t *p = (probe_t *) cbdata;
+    pmix_namespace_t *ns, *nptr = NULL;
+    pmix_rank_info_t *info;
+    pmix_peer_t *peer;
+    int i;
+
+    (void) sd;
+    (void) args;
+    PMIX_LIST_FOREACH (ns, &pmix_globals.nspaces, pmix_namespace_t) {
+        if (NULL != ns->nspace && 0 == strcmp(ns->nspace, p->nspace)) {
+            nptr = ns;
+            break;
+        }
+    }
+    if (NULL != nptr) {
+        p->listed = true;
+        p->self_started = nptr->self_started;
+        PMIX_LIST_FOREACH (info, &nptr->ranks, pmix_rank_info_t) {
+            if (info->pname.rank == p->rank) {
+                ++p->nranks;
+            }
+        }
+        for (i = 0; i < pmix_server_globals.clients.size; i++) {
+            peer = (pmix_peer_t *) pmix_pointer_array_get_item(&pmix_server_globals.clients, i);
+            if (NULL != peer && peer->nptr == nptr && 0 <= peer->sd) {
+                ++p->nconnected;
+            }
+        }
+    }
+    PMIX_WAKEUP_THREAD(&p->lock);
+}
+
+static void probe(const char *nspace, pmix_rank_t rank, probe_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    PMIX_CONSTRUCT_LOCK(&p->lock);
+    p->nspace = nspace;
+    p->rank = rank;
+    PMIX_THREADSHIFT(p, probe_fn);
+    PMIX_WAIT_THREAD(&p->lock);
+    PMIX_DESTRUCT_LOCK(&p->lock);
+}
+
+/* a departure is seen when the server reads the socket closing, which
+ * need not have happened by the time the child is reaped */
+static bool wait_gone(const char *nspace)
+{
+    probe_t p;
+    int n;
+
+    for (n = 0; n < 1000; n++) {
+        probe(nspace, 0, &p);
+        if (!p.listed) {
+            return true;
+        }
+        usleep(10000);
+    }
+    return false;
+}
+
+static bool wait_rank_gone(const char *nspace, pmix_rank_t rank)
+{
+    probe_t p;
+    int n;
+
+    for (n = 0; n < 1000; n++) {
+        probe(nspace, rank, &p);
+        if (0 == p.nranks) {
+            return p.listed;
+        }
+        usleep(10000);
+    }
+    return false;
 }
 
 static pmix_namespace_t *find_nspace(const char *nspace)
@@ -331,55 +567,26 @@ static pmix_status_t register_client(const char *nspace, pmix_rank_t rank, uid_t
 
 static void self_started_cases(void)
 {
-    int ready[2], go[2];
-    char **extra = NULL, **env;
-    char *tmp, c = 'g';
-    pid_t holder;
-    pmix_namespace_t *ns;
+    held_t h1, h2;
+    char **env;
+    probe_t p;
     pmix_proc_t proc;
 
     /* a self-started tool builds nsm.self and stays connected */
-    if (0 != pipe(ready) || 0 != pipe(go)) {
-        report("self-started tool held connected", 0);
-        return;
-    }
-    fcntl(ready[0], F_SETFD, FD_CLOEXEC);
-    fcntl(go[1], F_SETFD, FD_CLOEXEC);
-    pmix_asprintf(&tmp, "NSM_URI=%s", server_uri);
-    PMIx_Argv_append_nosize(&extra, tmp);
-    free(tmp);
-    PMIx_Argv_append_nosize(&extra, "NSM_NSPACE=" NSM_SELF);
-    PMIx_Argv_append_nosize(&extra, "NSM_RANK=0");
-    pmix_asprintf(&tmp, "NSM_READYFD=%d", ready[1]);
-    PMIx_Argv_append_nosize(&extra, tmp);
-    free(tmp);
-    pmix_asprintf(&tmp, "NSM_GOFD=%d", go[0]);
-    PMIx_Argv_append_nosize(&extra, tmp);
-    free(tmp);
-    env = child_env(extra);
-    holder = launch("tool", env);
-    PMIx_Argv_free(extra);
-    PMIx_Argv_free(env);
-    close(ready[1]);
-    close(go[0]);
-    if (1 != read(ready[0], &c, 1)) {
+    if (!hold(NSM_SELF, "0", &h1)) {
         report("self-started tool connects with its own namespace", 0);
-        close(go[1]);
-        close(ready[0]);
-        reap(holder);
+        (void) let_go(&h1);
         return;
     }
     report("self-started tool connects with its own namespace", 1);
-    ns = find_nspace(NSM_SELF);
-    report("its namespace is marked as a self-started tool's",
-           NULL != ns && ns->self_started);
+    probe(NSM_SELF, 0, &p);
+    report("its namespace is marked as a self-started tool's", p.listed && p.self_started);
 
     report("the host cannot register a client into it",
            PMIX_ERR_NOT_SUPPORTED == register_client(NSM_SELF, 1, getuid(), getgid()));
 
     /* a client naming the tool's rank - the env a client of the host's
      * job gets, retargeted at the tool's namespace */
-    extra = NULL;
     PMIX_LOAD_PROCID(&proc, NSM_JOB, 0);
     env = child_env(NULL);
     if (PMIX_SUCCESS == PMIx_server_setup_fork(&proc, &env)) {
@@ -394,16 +601,60 @@ static void self_started_cases(void)
 
     report("a second self-started tool of the same user joins it",
            CHILD_CONNECTED == tool(NSM_SELF, "1", false));
+    report("the rank it held goes when it leaves, and the namespace stays",
+           wait_rank_gone(NSM_SELF, 1));
     report("a tool-client cannot connect into it",
            CHILD_REFUSED == tool(NSM_SELF, "0", true));
 
-    /* let the first tool go */
-    if (1 != write(go[1], &c, 1)) {
-        /* it is gone already */
+    /* a clone: a second process as the same rank */
+    if (hold(NSM_SELF, "0", &h2)) {
+        probe(NSM_SELF, 0, &p);
+        report("a clone of its rank connects and shares the rank's entry",
+               p.listed && 1 == p.nranks && 2 == p.nconnected);
+    } else {
+        report("a clone of its rank connects and shares the rank's entry", 0);
     }
-    close(go[1]);
-    close(ready[0]);
-    report("the first self-started tool finalized cleanly", CHILD_CONNECTED == reap(holder));
+    report("the clone finalized cleanly", CHILD_CONNECTED == let_go(&h2));
+
+    report("the first self-started tool finalized cleanly", CHILD_CONNECTED == let_go(&h1));
+    report("the namespace goes when its last process leaves", wait_gone(NSM_SELF));
+    report("a tool can come back as the same rank of it",
+           CHILD_CONNECTED == tool(NSM_SELF, "0", false));
+    report("and it goes again when that tool leaves", wait_gone(NSM_SELF));
+
+    /* leaving without finalizing */
+    report("a self-started tool that will not finalize connects",
+           CHILD_CONNECTED == tool_nofinal(NSM_LOST, "0"));
+    report("the host is told at once that it left", wait_lost());
+    report("its namespace goes when it exits", wait_gone(NSM_LOST));
+    report("and it can come back", CHILD_CONNECTED == tool(NSM_LOST, "0", false));
+}
+
+/* The namespace a tool joins is deregistered while the host decides on
+ * the tool. The tool connects on a namespace of its own that the server
+ * holds - not on the one that went. */
+static void vanished_case(void)
+{
+    held_t h1, h2;
+    probe_t p;
+    bool ok;
+
+    if (!hold(NSM_GONE, "0", &h1)) {
+        report("a tool builds the namespace another will join", 0);
+        (void) let_go(&h1);
+        return;
+    }
+    dereg_in_upcall = NSM_GONE;
+    ok = hold(NSM_GONE, "1", &h2);
+    dereg_in_upcall = NULL;
+    report("a tool whose namespace goes while the host decides connects", ok);
+    probe(NSM_GONE, 1, &p);
+    report("on a namespace the server holds",
+           ok && p.listed && p.self_started && 1 == p.nranks && 1 == p.nconnected);
+    report("and leaves cleanly", CHILD_CONNECTED == let_go(&h2));
+    /* the first one's server dropped it, so how it exits is not asked */
+    (void) let_go(&h1);
+    report("that namespace goes too", wait_gone(NSM_GONE));
 }
 
 int main(int argc, char **argv)
@@ -414,7 +665,10 @@ int main(int argc, char **argv)
     pmix_rank_info_t *info = NULL;
     pmix_nspace_t job;
     volatile pmix_status_t st;
-    bool flag = true;
+    bool flag = true, ok;
+    pmix_status_t code;
+    held_t h;
+    probe_t p;
     int n;
 
     if (1 < argc && 0 == strcmp(argv[1], "tool")) {
@@ -424,14 +678,26 @@ int main(int argc, char **argv)
         return run_client();
     }
     self_argv0 = argv[0];
+    /* a held tool may be gone when it is told to go */
+    signal(SIGPIPE, SIG_IGN);
 
     fprintf(stdout, "\n=== namespace membership unit test ===\n\n");
 
+    /* lost connections are held this long to be reported together - long
+     * enough that one held for it cannot pass for one reported at once */
+    setenv("PMIX_MCA_pmix_event_caching_window", "30", 1);
     PMIX_INFO_LOAD(&sinfo, PMIX_SERVER_TOOL_SUPPORT, &flag, PMIX_BOOL);
     rc = PMIx_server_init(&mymodule, &sinfo, 1);
     PMIX_INFO_DESTRUCT(&sinfo);
     if (PMIX_SUCCESS != rc) {
         fprintf(stderr, "PMIx_server_init failed: %s\n", PMIx_Error_string(rc));
+        return 1;
+    }
+    code = PMIX_ERR_LOST_CONNECTION;
+    rc = PMIx_Register_event_handler(&code, 1, NULL, 0, lost_fn, NULL, NULL);
+    if (0 > rc) {
+        fprintf(stderr, "cannot register for lost connections: %s\n", PMIx_Error_string(rc));
+        PMIx_server_finalize();
         return 1;
     }
     server_uri = pmix_ptl_base.listener.uri;
@@ -473,11 +739,15 @@ int main(int argc, char **argv)
     report("a tool cannot be handed the host's job as its identity",
            CHILD_REFUSED == tool(NULL, NULL, false));
     assign = ASSIGN_FRESH;
-    report("a tool whose job the host registers during the upcall connects",
-           CHILD_CONNECTED == tool(NULL, NULL, false));
-    ns = find_nspace(NSM_FRESH);
-    report("that namespace is marked as a self-started tool's",
-           NULL != ns && ns->self_started);
+    ok = hold(NULL, NULL, &h);
+    report("a tool whose job the host registers during the upcall connects", ok);
+    probe(NSM_FRESH, 0, &p);
+    report("that namespace is marked as a self-started tool's", ok && p.listed && p.self_started);
+    report("and leaves cleanly", CHILD_CONNECTED == let_go(&h));
+    report("and the namespace goes with it, though the host registered it",
+           wait_gone(NSM_FRESH));
+
+    vanished_case();
 
     /* registering a rank again updates it */
     report("registering a rank again succeeds",

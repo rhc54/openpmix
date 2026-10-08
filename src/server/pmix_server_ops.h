@@ -679,6 +679,15 @@ PMIX_EXPORT bool pmix_server_prune_reginfo(pmix_regevents_info_t *reginfo);
  * docs/how-things-work/init-finalize.rst. */
 PMIX_EXPORT void pmix_server_peer_finalized(pmix_peer_t *peer);
 
+/* Handle the departure of a self-started tool's process, finalized or
+ * not, whose socket has dropped. The peer is freed. Its rank entry goes
+ * if no other connected process holds that rank, and the whole namespace
+ * goes - as a deregistration would remove it - if no connected process is
+ * left in it. The host started no such tool and may never hear it left,
+ * so nothing else would remove them; a tool that comes back builds them
+ * again. Must be the caller's last use of the peer. */
+PMIX_EXPORT void pmix_server_tool_departed(pmix_peer_t *peer);
+
 PMIX_EXPORT pmix_status_t pmix_server_fabric_register(pmix_server_caddy_t *cd, pmix_buffer_t *buf,
                                                       pmix_info_cbfunc_t cbfunc);
 

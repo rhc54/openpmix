@@ -243,9 +243,12 @@ client_finalized
 ^^^^^^^^^^^^^^^^^
 
 ``client_finalized`` (``pmix_server_client_finalized_fn_t``) |mdash| Notifies the
-host that a local client has called `PMIx_Finalize`. The client is held blocked
-until the host invokes ``cbfunc``. The host should release any per-client state
-it associated with the process via ``PMIx_server_register_client``.
+host that a local client has called `PMIx_Finalize`, or a connected tool has
+called `PMIx_tool_finalize`. The process is held blocked until the host invokes
+``cbfunc``. The host should release any per-client state it associated with the
+process via ``PMIx_server_register_client``. For a tool the host did not
+register, ``server_object`` is NULL; see ``tool_connected2`` for how long that
+tool's namespace lasts.
 
 abort
 ^^^^^
@@ -587,6 +590,19 @@ The info array is what the tool sent, with ``PMIX_USERID``, ``PMIX_GRPID`` and
 server established for the connection, as for ``client_connected2``. Anything
 else in it, ``PMIX_REALUID`` and ``PMIX_REALGID`` included, is the tool's own
 account and is not checked.
+
+A tool the host did not start (and so did not register with
+:ref:`PMIx_server_register_client(3) <man3-PMIx_server_register_client>`) has a
+namespace that lasts only while one of its processes is connected. When the
+last one disconnects, finalized or not, the library removes the namespace and
+everything held for it - including any job data the host registered for it
+during this upcall - as
+:ref:`PMIx_server_deregister_nspace(3) <man3-PMIx_server_deregister_nspace>`
+would. A later deregistration of that namespace by the host does nothing. A
+library that does this defines ``PMIX_CAP_TOOL_NSPACE_RELEASE``. A tool
+that reconnects under the same namespace is a new connection: this upcall is
+made again, and the host registers its job data again if the tool is to have
+any.
 
 log2
 ^^^^

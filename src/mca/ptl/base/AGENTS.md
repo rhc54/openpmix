@@ -388,11 +388,47 @@ claimed group. It covers a process reconnecting as its rank and a clone
 connecting alongside it; a clone of a tool is held to it as a clone of a
 client is.
 
-A registration lasts until the host deregisters it. A client or tool
-that finalizes and later connects again, with no re-registration in
-between, is checked against the same entry. On the registration side,
-`_register_client` refuses a self-started tool's namespace and treats a
-second registration of a rank as an update. See
+A registration lasts until the host deregisters it. A client or
+tool-client that finalizes and later connects again, with no
+re-registration in between, is checked against the same entry. On the
+registration side, `_register_client` refuses a self-started tool's
+namespace and treats a second registration of a rank as an update.
+
+**A self-started tool's namespace lasts only while a process is
+connected in it.** The host did not start the tool and may never learn
+it left, so nothing would ever deregister it. `lost_connection()` hands
+every departing peer of a `self_started` namespace, finalized or not, to
+`pmix_server_tool_departed()` (`src/server/pmix_server_registration.c`):
+
+- the peer is retired at once - a self-started tool gets no tombstone;
+- its rank entry goes if no connected process still holds that rank;
+- the namespace goes if no connected process is left in it, torn down by
+  `release_nspace()` exactly as `PMIx_server_deregister_nspace` would -
+  including any job data the host registered for it during the upcall.
+
+A tool that comes back builds them again. A host that deregisters the
+namespace afterwards finds nothing, which is a no-op.
+`PMIX_CAP_TOOL_NSPACE_RELEASE` tells a host the library does this.
+"Connected" means in `pmix_server_globals.clients`: every departing
+self-started peer is taken out of it here, so whatever is left there is
+live. The namespace is released only if it is still the one listed under
+its name - one the host already deregistered may share its name with a
+newer one.
+
+Its abnormal departure is also reported at once rather than held for
+`pmix_event_caching_window`: the report is how the host learns the tool
+left, so it has to arrive before the tool can come back under the same
+name.
+
+**A namespace can vanish while the host decides on a tool.** A tool that
+named an existing namespace holds a reference to it across the
+`tool_connected` upcall, and the host may deregister it meanwhile, or
+its last process may leave. `process_cbfunc` checks the namespace is
+still listed. A tool-client is refused, as its registration is gone. A
+self-started tool starts a fresh namespace (`new_tool_nspace()`) and
+goes through `consolidate_nspace()`, as if it had found none. A
+self-started tool joining an existing namespace as a rank already there
+shares that rank's entry rather than adding a second one. See
 `test/unit/nspace_membership.c`.
 
 **`pmix_list_get_first()` on an empty list returns the list's sentinel,
@@ -867,7 +903,7 @@ Two regimes, described in the framework doc. What matters *here*:
 | `test/unit/ptl_stalled_peer.c` | with no timeout, a server keeps servicing requests past an idle, one-byte or partial connection; a connect-ack in pieces is waited for and parsed, an oversized one refused on its header; finalize closes the unfinished ones; the timeout drops them |
 | `test/unit/ptl_recv_timeout.c` | `pmix_ptl_base_recv_blocking` ends a blocking socket's receive at its timeout, and still waits out `EAGAIN` on a non-blocking one |
 | `test/unit/tool_nspace.c` | a real tool connection leaves exactly one namespace object, and the peer resolves through the one on the list |
-| `test/unit/nspace_membership.c` | clients, tool-clients and self-started tools each join only the namespaces they may, as the identity registered for them; the host's registration of a client into a self-started tool's namespace is refused and a repeat registration updates |
+| `test/unit/nspace_membership.c` | clients, tool-clients and self-started tools each join only the namespaces they may, as the identity registered for them; the host's registration of a client into a self-started tool's namespace is refused and a repeat registration updates; a self-started tool's rank and namespace go when no connected process holds them, however it left, and a tool can come back; a namespace that vanishes during the upcall |
 | `test/unit/tool_cycle.c`, `client_cycle.c` | repeated connect/finalize cycles through this code |
 | `contrib/dockerswarm/run-ptl-tests.sh` | the paths a single node cannot reach: tools connecting across nodes, discovery by pid/nspace, remote-connection interface selection |
 

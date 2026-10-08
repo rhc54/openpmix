@@ -1097,19 +1097,16 @@ static void remove_client(pmix_namespace_t *nptr, pmix_proc_t *p)
     return;
 }
 
-static void _deregister_nspace(int sd, short args, void *cbdata)
+/* Release everything this server holds for a namespace - its job-level
+ * resources, its data, the events and requests naming it, its rank
+ * entries and any peers still on them - and the namespace object itself.
+ * Two things end a namespace: the host deregistering it, and the last
+ * process of a self-started tool's namespace leaving, which the host need
+ * never hear of. */
+static pmix_status_t release_nspace(pmix_proc_t *proc)
 {
-    pmix_setup_caddy_t *cd = (pmix_setup_caddy_t *) cbdata;
     pmix_namespace_t *tmp, *nptr;
     pmix_status_t rc;
-
-    PMIX_ACQUIRE_OBJECT(cd);
-
-    pmix_output_verbose(2, pmix_server_globals.base_output,
-                        "pmix:server _deregister_nspace %s",
-                        cd->proc.nspace);
-
-    PMIX_HIDE_UNUSED_PARAMS(sd, args);
 
     /* flush anything that is still trying to be written out */
     pmix_iof_static_dump_output(&pmix_client_globals.iof_stdout);
@@ -1121,27 +1118,27 @@ static void _deregister_nspace(int sd, short args, void *cbdata)
      * for weeks, nothing else would ever reclaim them.  Before the GDS
      * and event teardown below, so a notice raised here still has
      * somewhere to go. */
-    pmix_show_help_purge_nspace(cd->proc.nspace);
+    pmix_show_help_purge_nspace(proc->nspace);
 
     /* release any job-level network resources */
-    pmix_pnet.deregister_nspace(cd->proc.nspace);
+    pmix_pnet.deregister_nspace(proc->nspace);
 
     /* and any job-level GPU resources.  pgpu caches one envar list per
      * namespace, holding a reference on the namespace object while it
      * does, and this is the only thing that releases it - without this
      * call a persistent server accumulates one of each per job it ever
      * ran */
-    pmix_pgpu.deregister_nspace(cd->proc.nspace);
+    pmix_pgpu.deregister_nspace(proc->nspace);
 
     /* release any programming model info */
-    pmix_pmdl.deregister_nspace(cd->proc.nspace);
+    pmix_pmdl.deregister_nspace(proc->nspace);
 
     /* let our local storage clean up */
-    PMIX_GDS_DEL_NSPACE(rc, cd->proc.nspace);
+    PMIX_GDS_DEL_NSPACE(rc, proc->nspace);
 
     /* remove any event registrations, IOF registrations, and
      * cached notifications targeting procs from this nspace */
-    pmix_server_purge_events(NULL, &cd->proc, PMIX_ERR_NOT_FOUND);
+    pmix_server_purge_events(NULL, proc, PMIX_ERR_NOT_FOUND);
 
     /* find the nspace object. Compare exactly, as every other lookup in
      * this file does: PMIX_CHECK_NSPACE answers true whenever *either*
@@ -1152,14 +1149,14 @@ static void _deregister_nspace(int sd, short args, void *cbdata)
      * would match is not a name registration could have created. */
     nptr = NULL;
     PMIX_LIST_FOREACH (tmp, &pmix_globals.nspaces, pmix_namespace_t) {
-        if (0 == strcmp(tmp->nspace, cd->proc.nspace)) {
+        if (0 == strcmp(tmp->nspace, proc->nspace)) {
             nptr = tmp;
             break;
         }
     }
     if (NULL == nptr) {
         /* nothing to do */
-        goto cleanup;
+        return rc;
     }
 
     // ensure all local clients have been deregistered
@@ -1176,8 +1173,24 @@ static void _deregister_nspace(int sd, short args, void *cbdata)
     /* remove and release it */
     pmix_list_remove_item(&pmix_globals.nspaces, &nptr->super);
     PMIX_RELEASE(nptr);
+    return rc;
+}
 
-cleanup:
+static void _deregister_nspace(int sd, short args, void *cbdata)
+{
+    pmix_setup_caddy_t *cd = (pmix_setup_caddy_t *) cbdata;
+    pmix_status_t rc;
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    pmix_output_verbose(2, pmix_server_globals.base_output,
+                        "pmix:server _deregister_nspace %s",
+                        cd->proc.nspace);
+
+    PMIX_HIDE_UNUSED_PARAMS(sd, args);
+
+    rc = release_nspace(&cd->proc);
+
     /* release the caller, if there is one waiting - a request that had to
      * be completed asynchronously because it came from the progress
      * thread carries no callback */
@@ -1185,6 +1198,67 @@ cleanup:
         cd->opcbfunc(rc, cd->cbdata);
     }
     PMIX_RELEASE(cd);
+}
+
+void pmix_server_tool_departed(pmix_peer_t *peer)
+{
+    pmix_namespace_t *nptr = peer->nptr, *ns;
+    pmix_rank_info_t *info = peer->info;
+    pmix_peer_t *pr;
+    pmix_proc_t proc;
+    bool rank_live = false, nspace_live = false;
+    int i;
+
+    pmix_output_verbose(2, pmix_server_globals.base_output,
+                        "pmix:server self-started tool %s:%u departed",
+                        nptr->nspace, info->pname.rank);
+
+    /* the peer may be freed below, and the rank entry and namespace with
+     * it - hold them until we are done looking at them */
+    PMIX_RETAIN(nptr);
+    PMIX_RETAIN(info);
+
+    /* retire the peer. One that left without finalizing is counted as
+     * finalized here, as remove_client would count it */
+    if (!peer->finalized) {
+        peer->finalized = true;
+        ++nptr->nfinalized;
+    }
+    pmix_server_peer_finalized(peer);
+
+    /* Every peer of this namespace still in the clients array is a
+     * connected process: one that leaves comes through here and is taken
+     * out. */
+    for (i = 0; i < pmix_server_globals.clients.size; i++) {
+        pr = (pmix_peer_t *) pmix_pointer_array_get_item(&pmix_server_globals.clients, i);
+        if (NULL == pr || pr->nptr != nptr) {
+            continue;
+        }
+        nspace_live = true;
+        if (pr->info == info) {
+            rank_live = true;
+            break;
+        }
+    }
+
+    if (!nspace_live) {
+        /* the namespace's last process has gone. Release it by name only
+         * if it is still the one listed under that name - it is released
+         * already if not, and the name may belong to a newer one */
+        PMIX_LIST_FOREACH (ns, &pmix_globals.nspaces, pmix_namespace_t) {
+            if (ns == nptr) {
+                PMIX_LOAD_PROCID(&proc, nptr->nspace, PMIX_RANK_WILDCARD);
+                (void) release_nspace(&proc);
+                break;
+            }
+        }
+    } else if (!rank_live) {
+        /* others remain, but none as this rank */
+        pmix_list_remove_item(&nptr->ranks, &info->super);
+        PMIX_RELEASE(info);
+    }
+    PMIX_RELEASE(info);
+    PMIX_RELEASE(nptr);
 }
 
 static void _register_session(int sd, short args, void *cbdata)

@@ -243,10 +243,17 @@ static void lost_connection(pmix_peer_t *peer)
              * peers at once, and one event naming them all is the point.
              * Losing my own server is not - I have exactly one, so that
              * chain can never gain a second source and the window is a
-             * second of delay in exchange for nothing. */
+             * second of delay in exchange for nothing.
+             *
+             * Nor is losing a self-started tool. It is a job of its own,
+             * and this report is how the host learns it left - so it has
+             * to reach the host before the tool can come back under the
+             * same name, or the host would take the report for the tool
+             * that came back. */
             PMIX_REPORT_EVENT_WINDOW(PMIX_ERR_LOST_CONNECTION, peer,
                                      PMIX_RANGE_PROC_LOCAL, _notify_complete,
-                                     (peer == pmix_client_globals.myserver)
+                                     (peer == pmix_client_globals.myserver ||
+                                      (NULL != peer->nptr && peer->nptr->self_started))
                                          ? &report_now
                                          : &pmix_globals.event_window);
         }
@@ -256,18 +263,24 @@ static void lost_connection(pmix_peer_t *peer)
          * deregistered. This MUST be the last use of peer here: the object
          * may be freed. The callers only issue a write barrier afterward
          * (they never dereference peer), so doing it inline is safe. */
-        if (peer->finalized && PMIX_PEER_IS_CLIENT(peer) && !PMIX_PEER_IS_TOOL(peer)) {
+        if (peer != pmix_client_globals.myserver && NULL != peer->nptr &&
+            peer->nptr->self_started) {
+            /* a self-started tool is retired however it left, and so are
+             * its rank entry and namespace once nothing connected holds
+             * them - the host did not start it and may never be told it
+             * went, so nothing else would. Coming back builds them anew */
+            pmix_server_tool_departed(peer);
+        } else if (peer->finalized && PMIX_PEER_IS_CLIENT(peer) && !PMIX_PEER_IS_TOOL(peer)) {
             /* a pure client is tombstoned - reclaimed on reconnect or
              * namespace deregistration */
             pmix_server_peer_finalized(peer);
         } else if (peer->finalized && PMIX_PEER_IS_TOOL(peer) && !PMIX_PEER_IS_CLIENT(peer)) {
-            /* a pure tool is freed outright: nothing resolves a tool through
-             * info->peerid, so it needs no tombstone, and it never reconnects
-             * onto the same rank (each tool init is assigned a fresh nspace),
-             * so leaving it would leak one peer per init/finalize cycle. A
-             * tool the host registered as a client keeps the client tombstone
-             * path above and is reclaimed by its tool reconnect (or namespace
-             * deregistration) instead. */
+            /* any other pure tool is freed outright: nothing resolves a
+             * tool through info->peerid, so it needs no tombstone, and
+             * leaving it would leak one peer per init/finalize cycle. A
+             * tool the host registered as a client keeps the client
+             * tombstone path above and is reclaimed by its tool reconnect
+             * (or namespace deregistration) instead. */
             pmix_server_peer_finalized(peer);
         }
 

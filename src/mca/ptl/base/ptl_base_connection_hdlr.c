@@ -934,6 +934,44 @@ static pmix_status_t refuse_tool(pmix_pending_connection_t *pnd, pmix_peer_t *pe
     return rc;
 }
 
+/* A namespace for a self-started tool, built by its connection. It holds
+ * self-started tools only, and belongs to the user the tool connected as.
+ * It goes on the server's list once the host has named the tool - see
+ * consolidate_nspace */
+static pmix_namespace_t *new_tool_nspace(pmix_pending_connection_t *pnd)
+{
+    pmix_namespace_t *nptr;
+
+    nptr = PMIX_NEW(pmix_namespace_t);
+    if (NULL == nptr) {
+        return NULL;
+    }
+    if (!pnd->need_id) {
+        // must have been given one
+        nptr->nspace = strdup(pnd->proc.nspace);
+    }
+    pmix_server_access_set_owner(nptr, pnd->uid, pnd->gid, PMIX_OWNER_REGISTERED);
+    nptr->self_started = true;
+    /* save the version */
+    nptr->version.major = pnd->proc_type.major;
+    nptr->version.minor = pnd->proc_type.minor;
+    nptr->version.release = pnd->proc_type.release;
+    return nptr;
+}
+
+/* Whether a namespace is still on the server's list */
+static bool nspace_on_list(pmix_namespace_t *nptr)
+{
+    pmix_namespace_t *ns;
+
+    PMIX_LIST_FOREACH (ns, &pmix_globals.nspaces, pmix_namespace_t) {
+        if (ns == nptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Put the namespace we built for a connecting tool onto the server's
  * global namespace list, and make sure that list holds exactly one
  * object per namespace name.
@@ -1060,7 +1098,7 @@ static void process_cbfunc(int sd, short args, void *cbdata)
     pmix_setup_caddy_t *cd = (pmix_setup_caddy_t *) cbdata;
     pmix_pending_connection_t *pnd = (pmix_pending_connection_t *) cd->cbdata;
     pmix_namespace_t *nptr = NULL;
-    pmix_rank_info_t *info;
+    pmix_rank_info_t *info, *rinfo;
     pmix_peer_t *peer = NULL, *pr2;
     pmix_status_t rc, reply;
     uint32_t u32;
@@ -1127,22 +1165,82 @@ static void process_cbfunc(int sd, short args, void *cbdata)
     peer = (pmix_peer_t *) pnd->peer;
     nptr = peer->nptr;
 
+    /* A namespace the tool found when it connected may have gone while
+     * the host decided on it - the host deregistered it, or the last
+     * process of a self-started tools' namespace left. A tool-client
+     * cannot connect without its registration. A self-started tool starts
+     * its namespace afresh, as though it had found none. */
+    if (!pnd->nspace_created && !nspace_on_list(nptr)) {
+        if (PMIX_TOOL_CLIENT == pnd->flag || PMIX_LAUNCHER_CLIENT == pnd->flag) {
+            pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                                "tool %s:%u is no longer registered",
+                                pnd->proc.nspace, pnd->proc.rank);
+            u32 = htonl((uint32_t) PMIX_ERR_NOT_FOUND);
+            (void) pmix_ptl_base_send_blocking(pnd->sd, (char *) &u32, sizeof(uint32_t));
+            goto error;
+        }
+        nptr = new_tool_nspace(pnd);
+        if (NULL == nptr) {
+            goto error;
+        }
+        /* the reference PMIX_NEW gave us is the one held for the list,
+         * as for any namespace we build here */
+        PMIX_RELEASE(peer->nptr);
+        PMIX_RETAIN(nptr);
+        peer->nptr = nptr;
+        pnd->nspace_created = true;
+    }
+
     /* if this tool wasn't initially registered as a client,
      * then add some required structures */
     if (PMIX_TOOL_CLIENT != pnd->flag && PMIX_LAUNCHER_CLIENT != pnd->flag) {
-        if (NULL != nptr->nspace) {
-            free(nptr->nspace);
+        info = NULL;
+        if (pnd->nspace_created) {
+            if (NULL != nptr->nspace) {
+                free(nptr->nspace);
+            }
+            nptr->nspace = strdup(cd->proc.nspace);
+        } else {
+            /* joining other self-started tools in the namespace it named,
+             * which is the name the host must give back. A process
+             * joining as a rank already there - a clone - shares that
+             * rank's entry, and must be who it describes */
+            if (0 != strcmp(nptr->nspace, cd->proc.nspace)) {
+                reply = PMIX_ERR_NOT_SUPPORTED;
+            } else {
+                PMIX_LIST_FOREACH (rinfo, &nptr->ranks, pmix_rank_info_t) {
+                    if (rinfo->pname.rank == cd->proc.rank) {
+                        info = rinfo;
+                        break;
+                    }
+                }
+                reply = (NULL == info || identity_matches(info, pnd->uid, pnd->gid))
+                            ? PMIX_SUCCESS : PMIX_ERR_INVALID_CRED;
+            }
+            if (PMIX_SUCCESS != reply) {
+                pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                                    "tool %s:%u may not join namespace %s: %s",
+                                    cd->proc.nspace, cd->proc.rank, nptr->nspace,
+                                    PMIx_Error_string(reply));
+                u32 = htonl((uint32_t) reply);
+                (void) pmix_ptl_base_send_blocking(pnd->sd, (char *) &u32, sizeof(uint32_t));
+                goto error;
+            }
         }
-        nptr->nspace = strdup(cd->proc.nspace);
-        info = PMIX_NEW(pmix_rank_info_t);
-        info->pname.nspace = strdup(nptr->nspace);
-        info->pname.rank = cd->proc.rank;
-        info->uid = pnd->uid;
-        info->gid = pnd->gid;
-        pmix_list_append(&nptr->ranks, &info->super);
-        PMIX_RETAIN(info);
-        peer->info = info;
-        pnd->rinfo_created = true;
+        if (NULL != info) {
+            PMIX_RETAIN(info);
+            peer->info = info;
+        } else {
+            info = PMIX_NEW(pmix_rank_info_t);
+            info->pname.nspace = strdup(nptr->nspace);
+            info->pname.rank = cd->proc.rank;
+            info->uid = pnd->uid;
+            info->gid = pnd->gid;
+            pmix_list_append(&nptr->ranks, &info->super);
+            PMIX_RETAIN(info);
+            peer->info = info;
+            pnd->rinfo_created = true;
+        }
     }
 
     /* The namespace has its final name now, so this is the point at
@@ -1374,7 +1472,7 @@ static void cnct_cbfunc(pmix_status_t status, pmix_proc_t *proc, void *cbdata)
 static pmix_status_t process_tool_request(pmix_pending_connection_t *pnd,
                                           char *mg, size_t cnt)
 {
-    pmix_peer_t *peer, *p2;
+    pmix_peer_t *peer;
     pmix_namespace_t *nptr, *tmp;
     pmix_rank_info_t *info;
     bool found;
@@ -1554,39 +1652,18 @@ static pmix_status_t process_tool_request(pmix_pending_connection_t *pnd,
             return PMIX_ERR_NOT_SUPPORTED;
         }
         info = (pmix_rank_info_t*)pmix_list_get_first(&nptr->ranks);
-        if (0 <= info->peerid) {
-            p2 = (pmix_peer_t*)pmix_pointer_array_get_item(&pmix_server_globals.clients, info->peerid);
-            if (NULL == p2) {
-                // that's an error
-                PMIX_RELEASE(peer);
-                PMIX_ERROR_LOG(PMIX_ERR_NOT_FOUND);
-                return PMIX_ERR_NOT_FOUND;
-            }
-        }
         /* all members of an nspace must be the same user */
         if (!identity_matches(info, pnd->uid, pnd->gid)) {
             return refuse_tool(pnd, peer, PMIX_ERR_INVALID_CRED);
         }
 
     } else {
-        nptr = PMIX_NEW(pmix_namespace_t);
+        nptr = new_tool_nspace(pnd);
         if (NULL == nptr) {
             PMIX_ERROR_LOG(PMIX_ERR_NOMEM);
             PMIX_RELEASE(peer);
             return PMIX_ERR_NOMEM;
         }
-        if (!pnd->need_id) {
-            // must have been given one
-            nptr->nspace = strdup(pnd->proc.nspace);
-        }
-        /* the tool's job belongs to the user it connected as, and holds
-         * self-started tools only */
-        pmix_server_access_set_owner(nptr, pnd->uid, pnd->gid, PMIX_OWNER_REGISTERED);
-        nptr->self_started = true;
-        /* save the version */
-        nptr->version.major = pnd->proc_type.major;
-        nptr->version.minor = pnd->proc_type.minor;
-        nptr->version.release = pnd->proc_type.release;
         pnd->nspace_created = true;
         /* must add the nspace to the global list after we return
          * from the host's upcall since they can/will assign the
