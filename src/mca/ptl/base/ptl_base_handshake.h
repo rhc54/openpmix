@@ -44,6 +44,9 @@ BEGIN_C_DECLS
  *  9 => singleton client - treated like a tool that has an identifier
  * ------------------------------------------
  * 10 => scheduler
+ * ------------------------------------------
+ * 11 => not a connector kind: the opening of a tool or server of this
+ *       release on another host - see PMIX_REMOTE_TOOL below
  */
 typedef uint8_t pmix_rnd_flag_t;
 #define PMIX_SIMPLE_CLIENT      0
@@ -57,6 +60,7 @@ typedef uint8_t pmix_rnd_flag_t;
 #define PMIX_LAUNCHER_CLIENT    8
 #define PMIX_SINGLETON_CLIENT   9
 #define PMIX_SCHEDULER_WITH_ID 10
+#define PMIX_REMOTE_TOOL       11
 
 /* The local socket's handshake. The client sends an offer: its
  * version, its type, its identifier where the type has one, and the
@@ -73,6 +77,36 @@ typedef uint8_t pmix_rnd_flag_t;
  * the wire-format name. */
 #define PMIX_PTL_OFFER_MAX_NAMES   16
 #define PMIX_PTL_OFFER_MAX_NAMELEN 64
+
+/* Between hosts. A tool, launcher, scheduler or server of this release on
+ * another host - the kernel here names neither end - runs the same three
+ * messages over TCP, with the server proving who it is first.
+ *
+ * 1. The opening, in the connect-ack's framing: an empty security name,
+ *    a credential length of 0, the flag PMIX_REMOTE_TOOL - the first
+ *    fields of the TCP connect-ack, so a server that does not take tools
+ *    on other hosts, of any release, refuses it as a connector kind it
+ *    does not know - then the offer exactly as on the local socket, whose
+ *    connector kind must be one of PMIX_TOOL_NEEDS_ID, PMIX_TOOL_GIVEN_ID,
+ *    PMIX_LAUNCHER_NEEDS_ID, PMIX_LAUNCHER_GIVEN_ID or
+ *    PMIX_SCHEDULER_WITH_ID (a client is refused), and whose security
+ *    list names only mechanisms that make bound credentials. Then the
+ *    tool's nonce, PMIX_PTL_AUTH_NONCE_LEN bytes, and its uid as a
+ *    uint32. Anything after that is a later release's, and ignored.
+ * 2. The choice: a status, then on success the choice as on the local
+ *    socket, then the server's nonce (PMIX_PTL_AUTH_NONCE_LEN bytes), a
+ *    uint32 length and the server's credential - create_bound, as a
+ *    server, over pmix_ptl_base_auth_bind(true, ...) of the two nonces
+ *    and the choice.
+ * 3. The credential message as on the local socket, but with a
+ *    credential create_bound made as a tool over
+ *    pmix_ptl_base_auth_bind(false, ...) of the same bytes.
+ *
+ * The server's credential tells the tool who the server runs as, and the
+ * tool's tells the server who the tool runs as: nothing either claims is
+ * believed. The replies after that are unchanged. The datastore chosen is
+ * PMIX_PTL_REMOTE_GDS: shared memory does not reach another host. */
+#define PMIX_PTL_REMOTE_GDS "hash"
 #define PMIX_PTL_CHOICE_MAX        (3 * (PMIX_PTL_OFFER_MAX_NAMELEN + 1) + 1)
 
 /* The following macros are used in the ptl_base_connection_hdlr.c

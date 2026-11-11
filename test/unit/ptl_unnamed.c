@@ -398,8 +398,16 @@ int main(void)
     c.version = cur;
     c.tail = "";
     c.offhost = true;
+#if PMIX_ENABLE_REMOTE_TOOLS
+    /* a tool dials such a server as one on another host, whose outcome
+     * depends on the network: ptl_remote covers that route, and
+     * ptl_remote_auth the exchange */
+    fprintf(stdout, "  SKIP: a server at an address that is not this host's is not dialled "
+                    "(a tool here reaches servers on other hosts)\n");
+#else
     both("a server at an address that is not this host's is not dialled", &c, PMIX_ERR_UNREACH,
          "not this host's", dir);
+#endif
 
     rmdir(dir);
     fprintf(stdout, "\n%d passed, %d failed\n", npass, nfail);

@@ -60,7 +60,9 @@ pmix_psec_module_t pmix_munge_module = {
     .init = munge_init,
     .finalize = munge_finalize,
     .create_cred = create_cred,
-    .validate_cred = validate_cred
+    .validate_cred = validate_cred,
+    .create_bound = create_bound,
+    .validate_bound = validate_bound
 };
 ```
 
@@ -128,6 +130,17 @@ screen rather than open-coding the loop — see the framework
   else, and is not accepted - not by a connection, and not by
   `PMIx_Validate_credential`. Decoding without asking for the payload
   would accept it.
+- **Between hosts, a credential carries its connection as its
+  payload.** `create_bound` encodes a role byte (`S` for a server's, `T`
+  for a tool's) followed by the bytes ptl binds the connection to - see
+  "Between hosts" in
+  [`../../ptl/base/ptl_base_handshake.h`](../../ptl/base/ptl_base_handshake.h)
+  - restricted with `MUNGE_OPT_UID_RESTRICTION` to the user `to` when one
+  is given, and fresh for each call. `validate_bound` decodes it and
+  requires the payload to be exactly that role and those bytes, and
+  returns the uid and gid munge proves. Both hosts must share a munge
+  key. Because `validate_cred` refuses any payload, a bound credential
+  is never accepted as an ordinary one, nor the other way round.
 
 ## Gotchas
 

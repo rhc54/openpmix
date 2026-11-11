@@ -184,17 +184,31 @@ during initialization.
   system-level PMIx server first, then fall back to a server identified by
   another attribute.
 * ``PMIX_SERVER_URI`` (char\*) |mdash| connect to the server at the given URI.
-  The server must be on this host: a TCP address that is not this host's is
-  not dialled, and the tool fails with ``PMIX_ERR_UNREACH``.
+  A TCP address that is not this host's is dialled only in a PMIx configured
+  ``--enable-remote-tools``, where the server proves who it is with ``munge``
+  or ``ssl`` before the tool sends its own credential (see
+  :ref:`label-conn-between-hosts`); otherwise it is not
+  dialled, and the tool fails with ``PMIX_ERR_UNREACH``.
+* ``PMIX_SERVER_ALT_URIS`` (char\*) |mdash| comma-delimited list of other
+  addresses, each of the form ``tcp4://host:port`` or ``tcp6://host:port``, at
+  which the server on another host named by ``PMIX_SERVER_URI`` or
+  ``PMIX_TCP_URI`` also accepts connections. If the URI's address cannot be
+  reached, each is tried in turn. An entry that is not such an address is
+  ``PMIX_ERR_BAD_PARAM``. A server taking tools from other hosts on a host with
+  several interfaces reports these as ``PMIX_MYSERVER_ALT_URIS``, and lists them
+  on the ``alturis:`` line of its rendezvous and report files, from which a tool
+  given such a file reads them itself.
 * ``PMIX_SERVER_NSPACE`` (char\*) |mdash| connect to the server of the given
   namespace.
 * ``PMIX_SERVER_PIDINFO`` (pid_t) |mdash| connect to the server embedded in the
   process with the given PID.
 * ``PMIX_TCP_URI`` (char\*) |mdash| URI of the server to connect to, or a file
   name containing it in the form ``file:<name of file>``. For this and
-  ``PMIX_SERVER_URI``, a TCP URI is refused with ``PMIX_ERR_NOT_SUPPORTED``
-  and no connection is made: pass the server's local-socket (``usock://``)
-  URI, or, for a server of a release before v7.0, its file.
+  ``PMIX_SERVER_URI``, a TCP URI of this host is refused with
+  ``PMIX_ERR_NOT_SUPPORTED`` and no connection is made: pass the server's
+  local-socket (``usock://``) URI, or, for a server of a release before v7.0,
+  its file. A TCP URI of another host is taken in a PMIx configured
+  ``--enable-remote-tools``, as for ``PMIX_SERVER_URI``.
 * ``PMIX_TOOL_ATTACHMENT_FILE`` (char\*) |mdash| file containing the connection
   information to be used for attaching to a server.
 * ``PMIX_CONNECT_TO_SCHEDULER`` (bool) |mdash| connect to the system scheduler.

@@ -118,9 +118,11 @@ On success `*info` carries `PMIX_CRED_TYPE`, and `PMIX_USERID` /
   user: that is whose socket the server is connected to. Nothing in the
   connection tells a relay apart from the peer itself, so this is
   documented in `native.rst` (Limits), not handled in code.
-- **There are no remote peers.** ptl refuses a TCP peer whose address
-  is not this host's before native is asked, whatever mechanism it
-  names. A tool where the kernel cannot name the server either may
+- **Remote peers are not native's.** ptl refuses a TCP peer whose
+  address is not this host's before native is asked, whatever mechanism
+  it names - unless it came through the exchange between hosts, which
+  only a mechanism with `create_bound`/`validate_bound` (munge, ssl) can
+  take part in, and native has neither. A tool where the kernel cannot name the server either may
   connect to a server of this release given its rendezvous file by name
   while it runs - see `pmix_ptl_base_check_server` in
   [`../../ptl/base/AGENTS.md`](../../ptl/base/AGENTS.md).

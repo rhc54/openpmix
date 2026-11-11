@@ -51,6 +51,9 @@ decide, among other things:
   ``PMIX_SERVER_SESSION_SUPPORT``);
 * whether tools running as other users may connect
   (``PMIX_SERVER_ALLOW_FOREIGN_TOOLS``);
+* whether tools and servers on other hosts may connect
+  (``PMIX_SERVER_REMOTE_CONNECTIONS``, in a PMIx configured
+  ``--enable-remote-tools``);
 * where the server's rendezvous files and session directories go
   (``PMIX_SERVER_TMPDIR``, ``PMIX_SYSTEM_TMPDIR``).
 
@@ -81,7 +84,8 @@ and :doc:`/how-things-work/session_dirs`.
 
    * **The host** sets it before calling ``PMIx_server_init`` - for
      example, ``PMIX_MCA_psec=munge`` in its environment - when its
-     deployment calls for particular methods.
+     deployment calls for particular methods, such as ``munge`` or
+     ``ssl`` for tools on other nodes.
    * **A system administrator** sets it in that installation's
      ``<prefix>/etc/pmix-mca-params-override.conf``, whose settings take
      precedence over the environment's - for every process that reads

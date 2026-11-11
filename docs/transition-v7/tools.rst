@@ -9,34 +9,35 @@ The reference for this page is :doc:`/how-things-work/connections`;
 each section below summarizes part of it.
 
 
-Tools connect only on their own node
-------------------------------------
+Tools connect on their own node, unless built otherwise
+-------------------------------------------------------
 
-**What changed.** PMIx messaging is node-local. A tool connects only
-to a PMIx server on the node it runs on. Connections from other nodes
-are gone, along with the ``ssl`` authentication that served them.
+**What changed.** By default PMIx messaging is node-local. A tool
+connects only to a PMIx server on the node it runs on, unless PMIx was
+configured ``--enable-remote-tools`` and the server takes tools from
+other nodes.
 
-* A tool will not dial a TCP address that is not its own host's
-  (``PMIX_ERR_UNREACH``).
-* A server takes no connection from another node, and a host that asks
-  it to (``PMIX_SERVER_REMOTE_CONNECTIONS``) fails to start.
+* Without that option, a tool will not dial a TCP address that is not
+  its own host's (``PMIX_ERR_UNREACH``), and a server takes no
+  connection from another node; a host that asks it to
+  (``PMIX_SERVER_REMOTE_CONNECTIONS``) fails to start.
+* With it, a tool given a server's TCP URI on another node - or the
+  server's report file, copied from that node - connects over TCP. The
+  two authenticate each other with ``munge`` or ``ssl``, the server
+  first. ``PMIX_SERVER_ALT_URIS`` gives the server's other addresses,
+  tried if the first does not answer. See :ref:`label-conn-between-hosts`.
 
-**What it means.** A tool must run on the same node as the server it
-talks to. A tool that needs something done on other nodes asks the
+**What it means.** Without remote tools, a tool must run on the same
+node as the server it talks to. A tool that needs something done on other nodes asks the
 host to do it, through the server on its own node - as clients always
 have.
 
 **Today.** A user running a launcher or a debugger from a login node
-uses ssh to reach the node where the DVM controller (``prte`` or
-``mpirun``) is running, and starts the tool there. This is the
-approach DDT recommends.
-
-**Coming.** Launching from a login node will remain possible. The
-method is being worked out: most likely ``prun`` becomes a PRRTE
-function that sends its launch request through PRRTE's own messaging.
-Debuggers are not settled yet.
-
-.. DRAFT: update when the login-node method is decided.
+either uses ssh to reach the node where the DVM controller (``prte`` or
+``mpirun``) is running, and starts the tool there - the approach DDT
+recommends - or, where PMIx was configured ``--enable-remote-tools`` and
+the DVM takes tools from other nodes, runs it on the login node with
+``munge`` or ``ssl`` configured on both ends.
 
 
 How a tool finds a server

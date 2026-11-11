@@ -114,7 +114,7 @@ static void test_parse_uri(void)
     report("parse_uri: empty string rejected", PMIX_SUCCESS != rc, "accepted");
 }
 
-#if PMIX_ENABLE_LEGACY_SUPPORT
+#if PMIX_ENABLE_TCP_TRANSPORT
 /* ---- pmix_ptl_base_setup_connection ------------------------------ */
 
 static void test_setup_connection(void)
@@ -494,9 +494,9 @@ int main(int argc, char **argv)
     fprintf(stdout, "\n=== ptl address and version parser unit tests ===\n\n");
 
     test_parse_uri();
-#if PMIX_ENABLE_LEGACY_SUPPORT
+#if PMIX_ENABLE_TCP_TRANSPORT
     /* the tcp transport's parsers - built only to carry peers of earlier
-     * releases */
+     * releases and tools on other hosts */
     test_setup_connection();
     test_setup_connection_ipv6();
     test_split_and_resolve();

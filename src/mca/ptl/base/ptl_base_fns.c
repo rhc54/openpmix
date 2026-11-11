@@ -68,6 +68,7 @@
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_if.h"
 #include "src/util/pmix_printf.h"
+#include "src/util/pmix_random_bytes.h"
 #include "src/util/pmix_show_help.h"
 #include "src/util/pmix_string_copy.h"
 #include "src/util/pmix_strnlen.h"
@@ -87,9 +88,11 @@ static void wipe_cred(pmix_byte_object_t *cred)
 /****    SUPPORTING FUNCTIONS    ****/
 static void timeout(int sd, short args, void *cbdata);
 static void retry_wait(const struct timeval *tv);
-static pmix_status_t build_offer(pmix_peer_t *peer, char **msgout, size_t *sz);
+static pmix_status_t build_offer(pmix_peer_t *peer, const unsigned char *nonce, char **msgout,
+                                 size_t *sz);
 static pmix_status_t apply_choice(pmix_peer_t *peer, char *msg, size_t len);
-static pmix_status_t build_credential(pmix_peer_t *peer, pmix_info_t *iptr, size_t niptr,
+static pmix_status_t build_credential(pmix_peer_t *peer, const pmix_byte_object_t *bind, uid_t to,
+                                      pmix_info_t *iptr, size_t niptr,
                                       char **msgout, size_t *sz);
 static pmix_status_t construct_message(pmix_peer_t *peer, char **msgout, size_t *sz,
                                        pmix_info_t *iptr, size_t niptr);
@@ -855,7 +858,7 @@ static pmix_status_t parse_conn_file(char *filename, bool optional, bool found_b
     char *uri = NULL;
     char *line, *local = NULL, *lns = NULL, *luri = NULL, *lhost;
     pmix_rank_t lrank;
-    char *bfrops = NULL, *psec = NULL, **dest;
+    char *bfrops = NULL, *psec = NULL, *alt = NULL, **dest;
     const char *tag;
     size_t taglen;
     char *lock = NULL;
@@ -976,6 +979,10 @@ process:
             } else if (0 == strncmp(line, PMIX_PTL_PSEC_TAG, strlen(PMIX_PTL_PSEC_TAG))) {
                 tag = PMIX_PTL_PSEC_TAG;
                 dest = &psec;
+            } else if (0 == strncmp(line, PMIX_PTL_ALT_URIS_TAG,
+                                    strlen(PMIX_PTL_ALT_URIS_TAG))) {
+                tag = PMIX_PTL_ALT_URIS_TAG;
+                dest = &alt;
             } else if (0 == strncmp(line, PMIX_PTL_LOCK_TAG, strlen(PMIX_PTL_LOCK_TAG))) {
                 tag = PMIX_PTL_LOCK_TAG;
                 dest = &lock;
@@ -1016,6 +1023,7 @@ process:
         free(local);
         free(bfrops);
         free(psec);
+        free(alt);
         return PMIX_ERR_NOT_FOUND;
     }
     if (gone) {
@@ -1027,6 +1035,7 @@ process:
         free(local);
         free(bfrops);
         free(psec);
+        free(alt);
         return PMIX_ERR_NOT_FOUND;
     }
 
@@ -1044,6 +1053,7 @@ process:
             free(local);
             free(bfrops);
             free(psec);
+            free(alt);
             return PMIX_ERR_NOMEM;
         }
         cn->nspace = nspace;
@@ -1055,6 +1065,10 @@ process:
         cn->owner = owned ? st.st_uid : (uid_t) -1;
         cn->bfrops = bfrops;
         cn->psec = psec;
+        /* the server's other addresses - for a tool on another host,
+         * which takes the first line's */
+        cn->alt_uris = alt;
+        alt = NULL;
         /* the local address is "<host>;<uri>": used only on the server's
          * host - a report file may be read on another - and only if it is
          * the same server's */
@@ -1074,6 +1088,7 @@ process:
         free(local);
         free(bfrops);
         free(psec);
+        free(alt);
         if (NULL != nspace) {
             free(nspace);
         }
@@ -1522,9 +1537,11 @@ static pmix_status_t check_peer(pmix_peer_t *peer, bool given, uid_t uid, gid_t 
         tcp = true;
         rc = pmix_util_getid_tcp(peer->sd, &kuid);
         if (PMIX_SUCCESS != rc) {
-            /* Only a server on this host is talked to: one at any address
-             * that is not this host's is on another host, or in another
-             * network namespace */
+            /* This checks a server reached as one on this host - one on
+             * another host proves who it is in the exchange between hosts,
+             * and is not asked about here. A far end at an address that is
+             * not this host's is on another host, or in another network
+             * namespace */
             if (0 != getpeername(peer->sd, (struct sockaddr *) &sa, &salen)) {
                 /* the server has closed the connection already */
                 return PMIX_ERR_UNREACH;
@@ -1901,7 +1918,7 @@ static pmix_status_t local_handshake(pmix_peer_t *peer, pmix_info_t iptr[], size
     pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
                         "pmix:ptl SEND OFFER");
     peer->proc_type.flag = pmix_ptl_base_set_flag(&sz);
-    rc = build_offer(peer, &msg, &sz);
+    rc = build_offer(peer, NULL, &msg, &sz);
     if (PMIX_SUCCESS != rc) {
         return rc;
     }
@@ -1949,7 +1966,213 @@ static pmix_status_t local_handshake(pmix_peer_t *peer, pmix_info_t iptr[], size
 
     pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
                         "pmix:ptl SEND CREDENTIAL");
-    rc = build_credential(peer, iptr, niptr, &msg, &sz);
+    rc = build_credential(peer, NULL, (uid_t) -1, iptr, niptr, &msg, &sz);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    /* the message carries our token, if we have one: it goes no further */
+    rc = pmix_ptl_base_send_blocking(peer->sd, msg, sz);
+    pmix_ptl_base_wipe_released(msg, sz);
+    free(msg);
+    if (PMIX_SUCCESS != rc) {
+        return (PMIX_ERR_TIMEOUT == rc) ? rc : PMIX_ERR_UNREACH;
+    }
+    return PMIX_SUCCESS;
+}
+
+/* Where the server at the far end of this socket is, for a message */
+static void server_where(int sd, char *buf, size_t len)
+{
+    struct sockaddr_storage sa;
+    pmix_socklen_t salen = sizeof(sa);
+
+    memset(&sa, 0, sizeof(sa));
+    if (0 == getpeername(sd, (struct sockaddr *) &sa, &salen)) {
+        snprintf(buf, len, "%s:%d", pmix_net_get_hostname((struct sockaddr *) &sa),
+                 pmix_net_get_port((struct sockaddr *) &sa));
+    } else {
+        snprintf(buf, len, "(unknown address)");
+    }
+}
+
+/* A server on another host would not prove who it is - one of an earlier
+ * release, or one that takes no tools from other hosts, will not - with
+ * `why`, its answer or our failure to read one */
+static void remote_refused(pmix_peer_t *peer, pmix_status_t why)
+{
+    char where[160];
+
+    server_where(peer->sd, where, sizeof(where));
+    pmix_show_help("help-ptl-base.txt", "remote-auth-refused", true, pmix_globals.hostname,
+                   where, PMIx_Error_string(why));
+}
+
+/* Check the proof a server on another host sent with its choice: its
+ * credential, made as a server for this connection - our nonce and its,
+ * and the choice as it sent it - and that the identity it proves is one
+ * we may talk to. On success *srvuid is that user, whom our own
+ * credential is for, and *tbind the bytes it is bound to (ours to free) */
+static pmix_status_t check_proof(pmix_peer_t *peer, bool given, uid_t uid, gid_t gid,
+                                 const unsigned char *tool, const unsigned char *srv,
+                                 const char *choice, size_t clen,
+                                 const pmix_byte_object_t *cred, uid_t *srvuid,
+                                 pmix_byte_object_t *tbind)
+{
+    pmix_psec_module_t *psec = peer->nptr->compat.psec;
+    pmix_byte_object_t sbind = PMIX_BYTE_OBJECT_STATIC_INIT;
+    char where[160];
+    uid_t kuid;
+    gid_t kgid;
+    pmix_status_t rc;
+
+    PMIX_BYTE_OBJECT_CONSTRUCT(tbind);
+    if (!pmix_psec_base_remote_capable(psec)) {
+        /* the server chose one we offered, and we offered only these */
+        return PMIX_ERR_NOT_SUPPORTED;
+    }
+    rc = pmix_ptl_base_auth_bind(true, tool, srv, choice, clen, &sbind);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    rc = psec->validate_bound(&sbind, true, cred, &kuid, &kgid);
+    PMIX_BYTE_OBJECT_DESTRUCT(&sbind);
+    if (PMIX_SUCCESS != rc) {
+        server_where(peer->sd, where, sizeof(where));
+        pmix_show_help("help-ptl-base.txt", "remote-server-unproven", true,
+                       pmix_globals.hostname, where, psec->name, PMIx_Error_string(rc));
+        return PMIX_ERR_INVALID_CRED;
+    }
+    rc = pmix_ptl_base_remote_server_ok(kuid, kgid, given, uid, gid);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                        "ptl:base: the server on another host at the far end of socket %d "
+                        "proved it is uid %lu gid %lu with %s",
+                        peer->sd, (unsigned long) kuid, (unsigned long) kgid, psec->name);
+    *srvuid = kuid;
+    return pmix_ptl_base_auth_bind(false, tool, srv, choice, clen, tbind);
+}
+
+/* The exchange with a server on another host, up to its final answer:
+ * send the opening, read its choice and its proof, check the proof and
+ * take the choice, then send our credential made for this connection.
+ * recv_connect_ack reads the answer to that. See "Between hosts" in
+ * ptl_base_handshake.h */
+static pmix_status_t remote_handshake(pmix_peer_t *peer, pmix_info_t iptr[], size_t niptr)
+{
+    unsigned char tool[PMIX_PTL_AUTH_NONCE_LEN], srv[PMIX_PTL_AUTH_NONCE_LEN];
+    char *msg = NULL, where[160], *ours;
+    char choice[PMIX_PTL_CHOICE_MAX + 1];
+    pmix_byte_object_t cred = PMIX_BYTE_OBJECT_STATIC_INIT;
+    pmix_byte_object_t tbind = PMIX_BYTE_OBJECT_STATIC_INIT;
+    size_t sz = 0, clen = 0;
+    struct timeval save;
+    pmix_socklen_t tsz = sizeof(save);
+    bool sockopt = true, refused = false;
+    uid_t srvuid = (uid_t) -1;
+    uint32_t u32;
+    pmix_status_t rc;
+
+    pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                        "pmix:ptl SEND OPENING TO A SERVER ON ANOTHER HOST");
+    peer->proc_type.flag = pmix_ptl_base_set_flag(&sz);
+    rc = pmix_util_random_bytes(tool, sizeof(tool));
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    sz = 0;
+    rc = build_offer(peer, tool, &msg, &sz);
+    if (PMIX_ERR_NOT_SUPPORTED == rc) {
+        server_where(peer->sd, where, sizeof(where));
+        ours = pmix_psec_base_get_available_modules();
+        pmix_show_help("help-ptl-base.txt", "remote-no-psec-tool", true, pmix_globals.hostname,
+                       where, (NULL == ours) ? "none" : ours);
+        free(ours);
+        return rc;
+    }
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    rc = pmix_ptl_base_send_blocking(peer->sd, msg, sz);
+    free(msg);
+    msg = NULL;
+    if (PMIX_SUCCESS != rc) {
+        return (PMIX_ERR_TIMEOUT == rc) ? rc : PMIX_ERR_UNREACH;
+    }
+
+    /* its answer: a status, its choice, its nonce and its credential */
+    rc = pmix_ptl_base_set_timeout(peer, &save, &tsz, &sockopt);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    rc = pmix_ptl_base_recv_blocking(peer->sd, (char *) &u32, sizeof(uint32_t));
+    if (PMIX_SUCCESS == rc) {
+        rc = server_status(ntohl(u32));
+        refused = (PMIX_SUCCESS != rc);
+    } else {
+        /* closed, or silent past the handshake wait - a server that does
+         * not take tools from other hosts closes, as one of an earlier
+         * release does */
+        refused = true;
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = pmix_ptl_base_recv_blocking(peer->sd, (char *) &u32, sizeof(uint32_t));
+    }
+    if (PMIX_SUCCESS == rc) {
+        clen = ntohl(u32);
+        if (0 == clen || PMIX_PTL_CHOICE_MAX < clen) {
+            rc = PMIX_ERR_BAD_PARAM;
+        }
+    }
+    if (PMIX_SUCCESS == rc) {
+        memset(choice, 0, sizeof(choice));
+        rc = pmix_ptl_base_recv_blocking(peer->sd, choice, clen);
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = pmix_ptl_base_recv_blocking(peer->sd, (char *) srv, sizeof(srv));
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = pmix_ptl_base_recv_blocking(peer->sd, (char *) &u32, sizeof(uint32_t));
+    }
+    if (PMIX_SUCCESS == rc) {
+        u32 = ntohl(u32);
+        if (0 == u32 || PMIX_MAX_CRED_SIZE < u32) {
+            rc = PMIX_ERR_BAD_PARAM;
+        } else if (NULL == (cred.bytes = (char *) malloc(u32))) {
+            rc = PMIX_ERR_NOMEM;
+        } else {
+            cred.size = u32;
+            rc = pmix_ptl_base_recv_blocking(peer->sd, cred.bytes, cred.size);
+        }
+    }
+    if (sockopt) {
+        if (0 != setsockopt(peer->sd, SOL_SOCKET, SO_RCVTIMEO, &save, tsz)) {
+            pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                                "pmix: could not reset setsockopt SO_RCVTIMEO");
+        }
+    }
+    if (refused) {
+        remote_refused(peer, rc);
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = apply_choice(peer, choice, clen);
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = check_proof(peer, pmix_ptl_base.server_expect_given,
+                         pmix_ptl_base.server_expect_uid, pmix_ptl_base.server_expect_gid,
+                         tool, srv, choice, clen, &cred, &srvuid, &tbind);
+    }
+    PMIX_BYTE_OBJECT_DESTRUCT(&cred);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_BYTE_OBJECT_DESTRUCT(&tbind);
+        return rc;
+    }
+
+    pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                        "pmix:ptl SEND CREDENTIAL TO A SERVER ON ANOTHER HOST");
+    rc = build_credential(peer, &tbind, srvuid, iptr, niptr, &msg, &sz);
+    PMIX_BYTE_OBJECT_DESTRUCT(&tbind);
     if (PMIX_SUCCESS != rc) {
         return rc;
     }
@@ -1993,7 +2216,9 @@ static pmix_status_t refuse_outdated(pmix_peer_t *peer, const char *uri)
                        pmix_globals.hostname, (int) major, (int) minor);
         return PMIX_ERR_NOT_SUPPORTED;
     }
-    if (pmix_ptl_base_is_tcp_uri(uri)) {
+    /* ...unless it is another host's, where a server of this release is
+     * reached over TCP in a build with remote tools */
+    if (pmix_ptl_base_is_tcp_uri(uri) && !pmix_ptl_base_uri_is_remote(uri)) {
         pmix_show_help("help-ptl-base.txt", "legacy-servers-tcp", true,
                        pmix_globals.hostname, uri);
         return PMIX_ERR_NOT_SUPPORTED;
@@ -2071,10 +2296,17 @@ static bool local_addr(const struct sockaddr_storage *addr)
 #endif
 }
 
-/* Only a server on this host is talked to. Over TCP, one at an address
- * that is not this host's is on another host - or in another network
- * namespace - and is not dialled: PMIX_ERR_UNREACH, saying so. The local
- * transport reaches only this host */
+bool pmix_ptl_base_local_addr(const struct sockaddr_storage *addr)
+{
+    return !pmix_ptl_base_test_remote && local_addr(addr);
+}
+
+/* Whether a server is on this host. Over TCP, one at an address that is
+ * not this host's is on another host - or in another network namespace -
+ * and is reported: PMIX_ERR_UNREACH, saying so. The local transport
+ * reaches only this host. The connect paths ask
+ * pmix_ptl_base_server_route, which takes a server on another host where
+ * this process may connect to one */
 pmix_status_t pmix_ptl_base_server_on_host(const struct sockaddr_storage *addr,
                                            const pmix_ptl_module_t *transport)
 {
@@ -2133,6 +2365,44 @@ static bool take_new_identity(void)
     return true;
 }
 
+/* Connect a socket to a server on another host at the first of its
+ * addresses that answers - its URI's, then each of the others its file or
+ * a PMIX_SERVER_ALT_URIS directive gave (pmix_ptl_base.connect_alt_uris).
+ * Only a failure to connect moves on to the next: once a socket is up,
+ * whatever the server says is its answer, and asking again at another of
+ * its addresses would only get the same one. An alternate that does not
+ * parse, or is not another host's, is passed over - it came from a file
+ * or a directive an older or foreign writer may have garbled */
+static pmix_status_t connect_alts(struct sockaddr_storage *addr, size_t *len, int *sd,
+                                  pmix_ptl_module_t **transport)
+{
+    char **alts;
+    pmix_status_t rc, arc;
+    int n;
+
+    rc = pmix_ptl_base_connect(addr, *len, sd);
+    if (PMIX_SUCCESS == rc || NULL == pmix_ptl_base.connect_alt_uris) {
+        return rc;
+    }
+    alts = PMIx_Argv_split(pmix_ptl_base.connect_alt_uris, ',');
+    for (n = 0; NULL != alts && NULL != alts[n]; n++) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base: the server's address is unreachable - trying %s",
+                            alts[n]);
+        arc = pmix_ptl_base_uri_to_addr(alts[n], addr, len, transport);
+        if (PMIX_SUCCESS != arc || NULL == *transport ||
+            NULL != (*transport)->peer_identity || pmix_ptl_base_local_addr(addr)) {
+            continue;
+        }
+        rc = pmix_ptl_base_connect(addr, *len, sd);
+        if (PMIX_SUCCESS == rc) {
+            break;
+        }
+    }
+    PMIx_Argv_free(alts);
+    return rc;
+}
+
 pmix_status_t pmix_ptl_base_make_connection(pmix_peer_t *peer, char *suri,
                                             pmix_info_t *iptr, size_t niptr)
 {
@@ -2140,24 +2410,29 @@ pmix_status_t pmix_ptl_base_make_connection(pmix_peer_t *peer, char *suri,
     pmix_ptl_module_t *transport = NULL;
     pmix_status_t rc;
     size_t len;
-    bool renamed = false;
+    bool renamed = false, remote = false;
 
     rc = refuse_outdated(peer, suri);
     if (PMIX_SUCCESS != rc) {
         return rc;
     }
 
-    /* setup the connection - to a server on this host */
+    /* setup the connection - to a server on this host, or as a tool or
+     * server to one on another */
     rc = pmix_ptl_base_uri_to_addr(suri, &myconnection, &len, &transport);
     if (PMIX_SUCCESS != rc) {
         return rc;
     }
-    rc = pmix_ptl_base_server_on_host(&myconnection, transport);
+    rc = pmix_ptl_base_server_route(&myconnection, transport, suri, &remote);
     if (PMIX_SUCCESS != rc) {
         return rc;
     }
     /* do not error log - might just be a stale connection point */
-    rc = pmix_ptl_base_connect(&myconnection, len, &peer->sd);
+    if (remote) {
+        rc = connect_alts(&myconnection, &len, &peer->sd, &transport);
+    } else {
+        rc = pmix_ptl_base_connect(&myconnection, len, &peer->sd);
+    }
     if (PMIX_SUCCESS != rc) {
         return rc;
     }
@@ -2173,20 +2448,26 @@ retry:
 
 connected:
 
-    /* the server must be one we may talk to, by what the kernel says of it */
-    rc = pmix_ptl_base_check_server(peer, pmix_ptl_base.server_expect_given,
-                                    pmix_ptl_base.server_expect_uid,
-                                    pmix_ptl_base.server_expect_gid,
-                                    pmix_ptl_base.server_release_vouched);
-    if (PMIX_SUCCESS != rc) {
-        CLOSE_THE_SOCKET(peer->sd);
-        return rc;
+    /* the server must be one we may talk to, by what the kernel says of it
+     * - or, on another host, by what its credential proves, which the
+     * exchange checks */
+    if (!remote) {
+        rc = pmix_ptl_base_check_server(peer, pmix_ptl_base.server_expect_given,
+                                        pmix_ptl_base.server_expect_uid,
+                                        pmix_ptl_base.server_expect_gid,
+                                        pmix_ptl_base.server_release_vouched);
+        if (PMIX_SUCCESS != rc) {
+            CLOSE_THE_SOCKET(peer->sd);
+            return rc;
+        }
     }
     bound_sends(peer->sd, true);
 
     /* send our identity and any authentication credentials to the server */
     if (local_transport(peer)) {
         rc = local_handshake(peer, iptr, niptr);
+    } else if (remote) {
+        rc = remote_handshake(peer, iptr, niptr);
     } else {
         rc = send_connect_ack(peer, iptr, niptr);
         if (PMIX_SUCCESS != rc) {
@@ -2327,6 +2608,9 @@ typedef enum {
     PMIX_CNCT_CHOICE_STATUS,
     PMIX_CNCT_CHOICE_LEN,
     PMIX_CNCT_CHOICE,
+    PMIX_CNCT_PROOF_NONCE,
+    PMIX_CNCT_PROOF_LEN,
+    PMIX_CNCT_PROOF,
     PMIX_CNCT_SENDING,
     PMIX_CNCT_STATUS,
     PMIX_CNCT_MY_NSPACE,
@@ -2368,6 +2652,21 @@ typedef struct {
     bool timer_active;
     int check_tries;              // looks again at a server the table does not list yet
     int wait;                     // the connect's bound in seconds, 0 for none
+    /* a server on another host - see "Between hosts" in
+     * ptl_base_handshake.h: its other addresses and the next to try, our
+     * nonce and its, its choice as it sent it, its credential as it
+     * arrives (`big`), and then whom it proved it is and the bytes our
+     * credential is bound to */
+    bool remote;
+    char **alts;
+    int nextalt;
+    unsigned char tool[PMIX_PTL_AUTH_NONCE_LEN];
+    unsigned char srv[PMIX_PTL_AUTH_NONCE_LEN];
+    char choice[PMIX_PTL_CHOICE_MAX + 1];
+    size_t choicelen;
+    char *big;
+    uid_t srvuid;
+    pmix_byte_object_t bind;
     pmix_ptl_connect_nb_cbfunc_t cbfunc;
     void *cbdata;
 } pmix_ptl_connect_op_t;
@@ -2406,6 +2705,16 @@ static void cnopcon(pmix_ptl_connect_op_t *p)
     p->timer_active = false;
     p->check_tries = 0;
     p->wait = 0;
+    p->remote = false;
+    p->alts = NULL;
+    p->nextalt = 0;
+    memset(p->tool, 0, sizeof(p->tool));
+    memset(p->srv, 0, sizeof(p->srv));
+    memset(p->choice, 0, sizeof(p->choice));
+    p->choicelen = 0;
+    p->big = NULL;
+    p->srvuid = (uid_t) -1;
+    PMIX_BYTE_OBJECT_CONSTRUCT(&p->bind);
     p->cbfunc = NULL;
     p->cbdata = NULL;
 }
@@ -2428,6 +2737,9 @@ static void cnopdes(pmix_ptl_connect_op_t *p)
     }
     pmix_ptl_base_wipe_released(p->msg, p->msglen);
     free(p->msg);
+    PMIx_Argv_free(p->alts);
+    free(p->big);
+    PMIX_BYTE_OBJECT_DESTRUCT(&p->bind);
 }
 static PMIX_CLASS_INSTANCE(pmix_ptl_connect_op_t,
                            pmix_list_item_t,
@@ -2524,7 +2836,25 @@ void pmix_ptl_base_connect_backoff(int tries, struct timeval *tv)
 static void cnct_retry(pmix_ptl_connect_op_t *op, int err)
 {
     struct timeval tv = {0, 0};
+    pmix_ptl_module_t *transport = NULL;
+    const char *next;
 
+    /* a server on another host may answer at another of its addresses */
+    while (PMIX_MAX_RETRIES < op->connect_tries && NULL != op->alts &&
+           NULL != op->alts[op->nextalt]) {
+        next = op->alts[op->nextalt++];
+        if (PMIX_SUCCESS != pmix_ptl_base_uri_to_addr(next, &op->addr, &op->addrlen,
+                                                      &transport) ||
+            NULL == transport || NULL != transport->peer_identity ||
+            pmix_ptl_base_local_addr(&op->addr)) {
+            continue;
+        }
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base:connect: the server's address is unreachable - "
+                            "trying %s", next);
+        op->transport = transport;
+        op->connect_tries = 0;
+    }
     if (PMIX_MAX_RETRIES < op->connect_tries) {
         cnct_finish(op, PMIX_ERR_UNREACH);
         return;
@@ -2623,8 +2953,10 @@ static void cnct_check(int sd, short args, void *cbdata)
     PMIX_ACQUIRE_OBJECT(op);
     op->ev_active = false;
     mode = (op->timer_active || CHECK_TRIES > op->check_tries) ? CHECK_ONCE : CHECK_LAST;
-    rc = check_peer(op->peer, op->expect_given, op->expect_uid, op->expect_gid, op->vouched,
-                    &op->claim, mode);
+    /* a server on another host proves who it is in the exchange */
+    rc = op->remote ? PMIX_SUCCESS
+                    : check_peer(op->peer, op->expect_given, op->expect_uid, op->expect_gid,
+                                 op->vouched, &op->claim, mode);
     if (PMIX_ERR_NOT_FOUND == rc && CHECK_ONCE == mode && peer_closed(op->sd)) {
         /* it will not be listed now - and there is nobody to talk to */
         pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
@@ -2650,7 +2982,25 @@ static void cnct_check(int sd, short args, void *cbdata)
     op->peer->proc_type.flag = pmix_ptl_base_set_flag(&sdsize);
     if (local_transport(op->peer)) {
         /* the local socket starts with the offer */
-        rc = build_offer(op->peer, &op->msg, &sdsize);
+        rc = build_offer(op->peer, NULL, &op->msg, &sdsize);
+        op->state = PMIX_CNCT_OFFERING;
+    } else if (op->remote) {
+        /* a server on another host with the opening */
+        rc = pmix_util_random_bytes(op->tool, sizeof(op->tool));
+        if (PMIX_SUCCESS == rc) {
+            sdsize = 0;
+            rc = build_offer(op->peer, op->tool, &op->msg, &sdsize);
+        }
+        if (PMIX_ERR_NOT_SUPPORTED == rc) {
+            char where[160], *ours = pmix_psec_base_get_available_modules();
+
+            server_where(op->sd, where, sizeof(where));
+            pmix_show_help("help-ptl-base.txt", "remote-no-psec-tool", true,
+                           pmix_globals.hostname, where, (NULL == ours) ? "none" : ours);
+            free(ours);
+            cnct_finish(op, rc);
+            return;
+        }
         op->state = PMIX_CNCT_OFFERING;
     } else {
         rc = construct_message(op->peer, &op->msg, &sdsize, op->iptr, op->niptr);
@@ -2778,6 +3128,9 @@ static pmix_status_t cnct_field(pmix_ptl_connect_op_t *op)
     case PMIX_CNCT_CHOICE_STATUS:
         reply = server_status(u32);
         if (PMIX_SUCCESS != reply) {
+            if (op->remote) {
+                remote_refused(op->peer, reply);
+            }
             return reply;
         }
         return cnct_expect(op, PMIX_CNCT_CHOICE_LEN, sizeof(uint32_t));
@@ -2793,7 +3146,48 @@ static pmix_status_t cnct_field(pmix_ptl_connect_op_t *op)
         if (PMIX_SUCCESS != rc) {
             return rc;
         }
-        rc = build_credential(op->peer, op->iptr, op->niptr, &op->msg, &op->msglen);
+        if (op->remote) {
+            /* the server's proof follows its choice */
+            memcpy(op->choice, op->field, op->fieldlen);
+            op->choicelen = op->fieldlen;
+            return cnct_expect(op, PMIX_CNCT_PROOF_NONCE, PMIX_PTL_AUTH_NONCE_LEN);
+        }
+        goto credential;
+
+    case PMIX_CNCT_PROOF_NONCE:
+        memcpy(op->srv, op->field, PMIX_PTL_AUTH_NONCE_LEN);
+        return cnct_expect(op, PMIX_CNCT_PROOF_LEN, sizeof(uint32_t));
+
+    case PMIX_CNCT_PROOF_LEN:
+        if (0 == u32 || PMIX_MAX_CRED_SIZE < u32) {
+            return PMIX_ERR_BAD_PARAM;
+        }
+        free(op->big);
+        op->big = (char *) malloc(u32);
+        if (NULL == op->big) {
+            return PMIX_ERR_NOMEM;
+        }
+        return cnct_expect(op, PMIX_CNCT_PROOF, u32);
+
+    case PMIX_CNCT_PROOF:
+        {
+            pmix_byte_object_t cred;
+
+            cred.bytes = op->big;
+            cred.size = op->fieldlen;
+            rc = check_proof(op->peer, op->expect_given, op->expect_uid, op->expect_gid,
+                             op->tool, op->srv, op->choice, op->choicelen, &cred,
+                             &op->srvuid, &op->bind);
+            free(op->big);
+            op->big = NULL;
+            if (PMIX_SUCCESS != rc) {
+                return rc;
+            }
+        }
+
+    credential:
+        rc = build_credential(op->peer, op->remote ? &op->bind : NULL, op->srvuid, op->iptr,
+                              op->niptr, &op->msg, &op->msglen);
         if (PMIX_SUCCESS != rc) {
             return rc;
         }
@@ -2875,7 +3269,9 @@ static void cnct_recv(int sd, short args, void *cbdata)
     op->ev_active = false;
 
     while (op->got < op->fieldlen) {
-        n = recv(op->sd, op->field + op->got, op->fieldlen - op->got, 0);
+        /* the server's credential may be longer than any other field */
+        n = recv(op->sd, ((PMIX_CNCT_PROOF == op->state) ? op->big : op->field) + op->got,
+                 op->fieldlen - op->got, 0);
         if (0 < n) {
             op->got += (size_t) n;
             continue;
@@ -2885,6 +3281,10 @@ static void cnct_recv(int sd, short args, void *cbdata)
                                 "ptl:base:connect: server closed the connection");
             if (PMIX_CNCT_STATUS == op->state) {
                 hint_closed_no_reply(op->peer, op->suri);
+            } else if (PMIX_CNCT_CHOICE_STATUS == op->state && op->remote) {
+                /* a server that takes no tools from other hosts closes,
+                 * as one of an earlier release does */
+                remote_refused(op->peer, PMIX_ERR_UNREACH);
             }
             cnct_finish(op, PMIX_ERR_UNREACH);
             return;
@@ -2955,7 +3355,11 @@ pmix_status_t pmix_ptl_base_start_connection(pmix_peer_t *peer, char *nspace,
     op->expect_gid = pmix_ptl_base.server_expect_gid;
     rc = pmix_ptl_base_uri_to_addr(suri, &op->addr, &op->addrlen, &op->transport);
     if (PMIX_SUCCESS == rc) {
-        rc = pmix_ptl_base_server_on_host(&op->addr, op->transport);
+        rc = pmix_ptl_base_server_route(&op->addr, op->transport, suri, &op->remote);
+    }
+    if (PMIX_SUCCESS == rc && op->remote && NULL != pmix_ptl_base.connect_alt_uris) {
+        /* the server's other addresses, carried with the connect */
+        op->alts = PMIx_Argv_split(pmix_ptl_base.connect_alt_uris, ',');
     }
     if (PMIX_SUCCESS != rc) {
         PMIX_RELEASE(op);
@@ -3175,10 +3579,45 @@ static size_t list_size(char **list)
         }                                                   \
     } while (0)
 
+/* The security mechanisms we have that make a credential for one
+ * connection between hosts, in priority order - what we offer a server on
+ * another host. NULL if none */
+static char *remote_psecs(void)
+{
+    char *avail = pmix_psec_base_get_available_modules(), **names, **keep = NULL, *out;
+    pmix_psec_module_t *mod;
+    int i;
+
+    names = (NULL == avail) ? NULL : PMIx_Argv_split(avail, ',');
+    free(avail);
+    for (i = 0; NULL != names && NULL != names[i]; i++) {
+        mod = pmix_psec_base_assign_module(names[i]);
+        if (NULL != mod && 0 == strcmp(mod->name, names[i]) &&
+            pmix_psec_base_remote_capable(mod)) {
+            if (PMIX_SUCCESS != PMIx_Argv_append_nosize(&keep, names[i])) {
+                PMIx_Argv_free(names);
+                PMIx_Argv_free(keep);
+                return NULL;
+            }
+        }
+    }
+    PMIx_Argv_free(names);
+    out = (NULL == keep) ? NULL : PMIx_Argv_join(keep, ',');
+    PMIx_Argv_free(keep);
+    return out;
+}
+
 /* The local socket's offer: our version, type and identifier, and the
  * security, wire-format and datastore components we have, with the wire
- * format and datastore chosen for this server first */
-static pmix_status_t build_offer(pmix_peer_t *peer, char **msgout, size_t *sz)
+ * format and datastore chosen for this server first.
+ *
+ * With `nonce`, the opening for a server on another host - see "Between
+ * hosts" in ptl_base_handshake.h: the same offer behind the first fields
+ * of a TCP connect-ack, naming only the mechanisms that make a credential
+ * for one connection and the datastore that reaches another host, then
+ * the nonce and our uid */
+static pmix_status_t build_offer(pmix_peer_t *peer, const unsigned char *nonce, char **msgout,
+                                 size_t *sz)
 {
     char **psecs = NULL, **bfrops = NULL, **gdss = NULL;
     pmix_bfrops_module_t *bfmod;
@@ -3196,15 +3635,25 @@ static pmix_status_t build_offer(pmix_peer_t *peer, char **msgout, size_t *sz)
                 ? peer->nptr->compat.bfrops : pmix_globals.mypeer->nptr->compat.bfrops;
     bftype = pmix_globals.mypeer->nptr->compat.type;
 
-    rc = offer_names(&psecs, NULL, pmix_psec_base_get_available_modules());
+    rc = offer_names(&psecs, NULL, (NULL != nonce) ? remote_psecs()
+                                                   : pmix_psec_base_get_available_modules());
     if (PMIX_SUCCESS == rc) {
         rc = offer_names(&bfrops, bfmod->version, pmix_bfrops_base_get_available_modules());
     }
     if (PMIX_SUCCESS == rc) {
-        rc = offer_names(&gdss, peer->nptr->compat.gds->name,
-                         pmix_gds_base_get_available_modules());
+        if (NULL != nonce) {
+            rc = offer_names(&gdss, PMIX_PTL_REMOTE_GDS, NULL);
+        } else {
+            rc = offer_names(&gdss, peer->nptr->compat.gds->name,
+                             pmix_gds_base_get_available_modules());
+        }
     }
     if (PMIX_SUCCESS != rc) {
+        goto done;
+    }
+    if (NULL != nonce && NULL == psecs) {
+        /* nothing that can prove who we are to a server on another host */
+        rc = PMIX_ERR_NOT_SUPPORTED;
         goto done;
     }
 
@@ -3232,6 +3681,11 @@ static pmix_status_t build_offer(pmix_peer_t *peer, char **msgout, size_t *sz)
         sdsize += strlen(pmix_globals.myid.nspace) + 1 + sizeof(uint32_t);
     }
     sdsize += list_size(psecs) + list_size(bfrops) + 1 + list_size(gdss);
+    if (NULL != nonce) {
+        /* an empty security name, a zero credential length and the flag
+         * before it, and the nonce and our uid after */
+        sdsize += 1 + sizeof(uint32_t) + 1 + PMIX_PTL_AUTH_NONCE_LEN + sizeof(uint32_t);
+    }
 
     memset(&hdr, 0, sizeof(pmix_ptl_hdr_t));
     hdr.pindex = -1;
@@ -3245,6 +3699,13 @@ static pmix_status_t build_offer(pmix_peer_t *peer, char **msgout, size_t *sz)
     }
     memcpy(msg, &hdr, sizeof(hdr));
     csize = sizeof(hdr);
+    if (NULL != nonce) {
+        uint8_t remote = PMIX_REMOTE_TOOL;
+
+        PMIX_PTL_PUT_STRING("");
+        PMIX_PTL_PUT_U32(0);
+        PMIX_PTL_PUT_U8(remote);
+    }
     PMIX_PTL_PUT_STRING(PMIX_VERSION);
     PMIX_PTL_PUT_U8(peer->proc_type.flag);
     if (named) {
@@ -3254,6 +3715,10 @@ static pmix_status_t build_offer(pmix_peer_t *peer, char **msgout, size_t *sz)
     PMIX_PTL_PUT_LIST(bfrops);
     PMIX_PTL_PUT_U8(bftype);
     PMIX_PTL_PUT_LIST(gdss);
+    if (NULL != nonce) {
+        PMIX_PTL_PUT_BLOB(nonce, PMIX_PTL_AUTH_NONCE_LEN);
+        PMIX_PTL_PUT_U32(geteuid());
+    }
     *msgout = msg;
     *sz = sdsize;
 
@@ -3318,8 +3783,11 @@ error:
 
 /* The local socket's credential message: the credential, made with the
  * chosen security component, and the info, packed in the chosen wire
- * format */
-static pmix_status_t build_credential(pmix_peer_t *peer, pmix_info_t *iptr, size_t niptr,
+ * format. With `bind`, a credential made for this one connection with a
+ * server on another host, as a tool, for the user `to` - see "Between
+ * hosts" in ptl_base_handshake.h */
+static pmix_status_t build_credential(pmix_peer_t *peer, const pmix_byte_object_t *bind, uid_t to,
+                                      pmix_info_t *iptr, size_t niptr,
                                       char **msgout, size_t *sz)
 {
     pmix_psec_module_t *psec = peer->nptr->compat.psec;
@@ -3334,14 +3802,19 @@ static pmix_status_t build_credential(pmix_peer_t *peer, pmix_info_t *iptr, size
     pmix_status_t rc;
 
     PMIX_BYTE_OBJECT_CONSTRUCT(&cred);
-    if (server_uid(peer, &suid)) {
-        PMIX_INFO_LOAD(&dir, PMIX_PSEC_SERVER_UID, &suid, PMIX_UINT32);
-        ndirs = 1;
-    }
-    rc = psec->create_cred((struct pmix_peer_t *) pmix_globals.mypeer,
-                           (0 < ndirs) ? &dir : NULL, ndirs, NULL, NULL, &cred);
-    if (0 < ndirs) {
-        PMIX_INFO_DESTRUCT(&dir);
+    if (NULL != bind) {
+        rc = (NULL == psec->create_bound) ? PMIX_ERR_NOT_SUPPORTED
+                                          : psec->create_bound(bind, false, to, &cred);
+    } else {
+        if (server_uid(peer, &suid)) {
+            PMIX_INFO_LOAD(&dir, PMIX_PSEC_SERVER_UID, &suid, PMIX_UINT32);
+            ndirs = 1;
+        }
+        rc = psec->create_cred((struct pmix_peer_t *) pmix_globals.mypeer,
+                               (0 < ndirs) ? &dir : NULL, ndirs, NULL, NULL, &cred);
+        if (0 < ndirs) {
+            PMIX_INFO_DESTRUCT(&dir);
+        }
     }
     if (PMIX_SUCCESS != rc) {
         wipe_cred(&cred);

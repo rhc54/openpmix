@@ -25,8 +25,9 @@
  * $HEADER$
  */
 
-/* The TCP transport: its listening socket, on a loopback interface, and
- * its tcp4:// and tcp6:// URIs. */
+/* The TCP transport: its listening sockets - on a loopback interface, or
+ * when tools on other hosts are taken the primary one and one on each
+ * other public interface - and its tcp4:// and tcp6:// URIs. */
 
 #include "src/include/pmix_config.h"
 #include "src/include/pmix_globals.h"
@@ -353,13 +354,155 @@ pmix_status_t pmix_ptl_tcp_split_and_resolve(const char *orig_str, const char *n
 }
 
 
-/* Open the listening socket, on a loopback interface: the TCP transport
- * serves peers of earlier releases on this host, and nothing else. The
- * listener gets the socket and its URI */
+/* Bind one more listening socket, on the interface at index @c ifidx.
+ *
+ * The port the primary listener got is tried first, so a static port
+ * directive holds for every address; if this address has it taken, the
+ * kernel picks one. Returns the listener, or NULL (having said why at
+ * verbosity) if this interface cannot be listened on - which costs a
+ * remote tool one way of reaching us, not the server its init. */
+static pmix_listener_t *open_alternate(const pmix_listener_t *primary, int ifidx,
+                                       uint16_t primary_port)
+{
+    struct sockaddr_storage addr;
+    pmix_socklen_t addrlen;
+    pmix_listener_t *alt;
+    char host[PMIX_MAXHOSTNAMELEN] = {0};
+    const char *prefix;
+    int attempt, flags;
+    uint16_t port = 0;
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        memset(&addr, 0, sizeof(addr));
+        if (PMIX_SUCCESS != pmix_ifindextoaddr(ifidx, (struct sockaddr *) &addr, sizeof(addr))) {
+            return NULL;
+        }
+        port = (0 == attempt) ? primary_port : 0;
+        if (AF_INET == addr.ss_family) {
+            ((struct sockaddr_in *) &addr)->sin_port = htons(port);
+            addrlen = sizeof(struct sockaddr_in);
+        } else if (AF_INET6 == addr.ss_family) {
+            ((struct sockaddr_in6 *) &addr)->sin6_port = htons(port);
+            addrlen = sizeof(struct sockaddr_in6);
+        } else {
+            return NULL;
+        }
+
+        alt = PMIX_NEW(pmix_listener_t);
+        if (NULL == alt) {
+            return NULL;
+        }
+        alt->socket = socket(addr.ss_family, SOCK_STREAM | PMIX_SOCK_CLOEXEC, 0);
+        if (0 > alt->socket) {
+            PMIX_RELEASE(alt);
+            return NULL;
+        }
+        flags = (0 != port) ? 1 : 0;
+        if (0 > setsockopt(alt->socket, SOL_SOCKET, SO_REUSEADDR, (const char *) &flags,
+                           sizeof(flags)) ||
+            PMIX_SUCCESS != pmix_fd_set_cloexec(alt->socket)) {
+            PMIX_RELEASE(alt);  // closes the socket
+            return NULL;
+        }
+        if (0 == bind(alt->socket, (struct sockaddr *) &addr, addrlen)) {
+            break;
+        }
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:tcp:setup_listener: alternate interface %d port %u: %s",
+                            ifidx, (unsigned) port, strerror(pmix_socket_errno));
+        PMIX_RELEASE(alt);
+        alt = NULL;
+        if (0 == primary_port ||
+            (EADDRINUSE != pmix_socket_errno && EADDRNOTAVAIL != pmix_socket_errno)) {
+            /* the kernel already chose this port, or the failure is not
+             * about the port - a second try would fail the same way */
+            return NULL;
+        }
+    }
+    if (NULL == alt) {
+        return NULL;
+    }
+
+    if (0 > getsockname(alt->socket, (struct sockaddr *) &addr, &addrlen) ||
+        0 > listen(alt->socket, SOMAXCONN) ||
+        0 > (flags = fcntl(alt->socket, F_GETFL, 0)) ||
+        0 > fcntl(alt->socket, F_SETFL, flags | O_NONBLOCK)) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:tcp:setup_listener: alternate interface %d: %s",
+                            ifidx, strerror(pmix_socket_errno));
+        PMIX_RELEASE(alt);
+        return NULL;
+    }
+
+    if (AF_INET == addr.ss_family) {
+        prefix = "tcp4://";
+        port = ntohs(((struct sockaddr_in *) &addr)->sin_port);
+        inet_ntop(AF_INET, &((struct sockaddr_in *) &addr)->sin_addr, host, sizeof(host) - 1);
+    } else {
+        prefix = "tcp6://";
+        port = ntohs(((struct sockaddr_in6 *) &addr)->sin6_port);
+        inet_ntop(AF_INET6, &((struct sockaddr_in6 *) &addr)->sin6_addr, host, sizeof(host) - 1);
+    }
+    /* an address and port only, in the form the URI carries after its ';' -
+     * the server's identity is the primary URI's, and is not repeated */
+    if (0 > pmix_asprintf(&alt->uri, "%s%s:%u", prefix, host, (unsigned) port)) {
+        PMIX_RELEASE(alt);
+        return NULL;
+    }
+    alt->protocol = primary->protocol;
+    alt->transport = primary->transport;
+    alt->cbfunc = primary->cbfunc;
+    return alt;
+}
+
+
+/* Listen on each of the other public interfaces the directives left us, so
+ * a remote tool that cannot reach the primary address can reach one of
+ * these. pmix_ptl_base.alt_uris gets the comma-delimited list of where. */
+static pmix_status_t open_alternates(const pmix_listener_t *primary, const int *altidx,
+                                     int naltidx, uint16_t primary_port)
+{
+    pmix_listener_t *alt;
+    char **uris = NULL;
+    int n;
+
+    for (n = 0; n < naltidx; n++) {
+        alt = open_alternate(primary, altidx[n], primary_port);
+        if (NULL == alt) {
+            continue;
+        }
+        if (PMIX_SUCCESS != PMIx_Argv_append_nosize(&uris, alt->uri)) {
+            PMIX_RELEASE(alt);
+            PMIx_Argv_free(uris);
+            return PMIX_ERR_NOMEM;
+        }
+        pmix_list_append(&pmix_ptl_base.alt_listeners, &alt->super);
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:tcp alternate URI %s", alt->uri);
+    }
+    if (NULL != uris) {
+        pmix_ptl_base.alt_uris = PMIx_Argv_join(uris, ',');
+        PMIx_Argv_free(uris);
+        if (NULL == pmix_ptl_base.alt_uris) {
+            return PMIX_ERR_NOMEM;
+        }
+    }
+    return PMIX_SUCCESS;
+}
+
+
+/* Open the listening socket. On a loopback interface when only peers of
+ * earlier releases on this host are taken; on the first public interface
+ * the directives leave when tools on other hosts are taken - and then one
+ * on each other public interface too, so a tool that cannot reach the
+ * first can reach another. Peers of earlier releases on this host reach
+ * the public one, whose address is this host's. The listener gets the
+ * socket and its URI */
 static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_listener_t *lt)
 {
     int flags = 0;
     int i, rc = 0, saveindex = -1;
+    int *altidx = NULL, naltidx = 0;
     char **interfaces = NULL, **candidates = NULL, **ports;
     bool including = false;
     char name[32];
@@ -438,8 +581,9 @@ static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_l
         return PMIX_ERR_SILENT;
     }
 
-    /* look at all available interfaces and pick a loopback one - we are
-     * only talking locally */
+    /* look at all available interfaces and pick a loopback one when we
+     * talk only to this host, or the public ones when tools on other
+     * hosts are taken */
     for (i = pmix_ifbegin(); i >= 0; i = pmix_ifnext(i)) {
         if (PMIX_SUCCESS != pmix_ifindextoaddr(i, (struct sockaddr *) &my_ss, sizeof(my_ss))) {
             pmix_output(0, "ptl:tcp:setup_listener: problems getting address for index %i (kernel index %i)\n", i,
@@ -496,6 +640,7 @@ static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_l
                 pmix_show_help("help-ptl-base.txt", "not-parseable", true);
                 PMIx_Argv_free(interfaces);
                 PMIx_Argv_free(candidates);
+                free(altidx);
                 return PMIX_ERR_BAD_PARAM;
             }
             /* if we are including, then ignore this if not present */
@@ -518,12 +663,37 @@ static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_l
         }
 
         /* an address on the loopback device that is not a loopback
-         * address is reached from other hosts too, and does not count */
+         * address is reached from other hosts too, and counts as a
+         * public one */
         if (pmix_ifisloopback(i) && pmix_net_islocalhost((struct sockaddr *) &my_ss)) {
+            if (pmix_ptl_base.remote_tools) {
+                continue;
+            }
             pmix_output_verbose(5, pmix_ptl_base_framework.framework_output,
                                 "ptl:tcp:setup_listener loopback interface %s found", name);
             saveindex = i;
             break;
+        }
+        if (!pmix_ptl_base.remote_tools) {
+            continue;
+        }
+        if (saveindex < 0) {
+            pmix_output_verbose(5, pmix_ptl_base_framework.framework_output,
+                                "ptl:tcp:setup_listener public interface %s found", name);
+            saveindex = i;
+        } else {
+            /* every other public interface the directives left us is
+             * somewhere a remote tool may be able to reach us from when it
+             * cannot reach the first - keep them all */
+            int *tmpidx = (int *) realloc(altidx, (naltidx + 1) * sizeof(int));
+            if (NULL == tmpidx) {
+                free(altidx);
+                PMIx_Argv_free(interfaces);
+                PMIx_Argv_free(candidates);
+                return PMIX_ERR_NOMEM;
+            }
+            altidx = tmpidx;
+            altidx[naltidx++] = i;
         }
     }
     /* cleanup */
@@ -531,14 +701,24 @@ static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_l
         PMIx_Argv_free(interfaces);
     }
 
-    /* with no loopback interface left by the directives there is nowhere
-     * to listen: a public interface is reached from other hosts */
+    /* with no interface of the kind we need left by the directives there
+     * is nowhere to listen. Without tools on other hosts that is a
+     * loopback one, and a public interface is never taken in its place:
+     * it is reached from other hosts */
     if (saveindex < 0) {
         prefix = PMIx_Argv_join(candidates, ',');
-        pmix_show_help("help-ptl-base.txt", "no-loopback-interfaces", true,
-                       (NULL == pmix_ptl_base.if_include) ? "NULL" : pmix_ptl_base.if_include,
-                       (NULL == pmix_ptl_base.if_exclude) ? "NULL" : pmix_ptl_base.if_exclude,
-                       prefix);
+        if (pmix_ptl_base.remote_tools) {
+            pmix_show_help("help-ptl-base.txt", "no-remote-interfaces", true,
+                           pmix_globals.hostname,
+                           (NULL == pmix_ptl_base.if_include) ? "NULL" : pmix_ptl_base.if_include,
+                           (NULL == pmix_ptl_base.if_exclude) ? "NULL" : pmix_ptl_base.if_exclude,
+                           prefix);
+        } else {
+            pmix_show_help("help-ptl-base.txt", "no-loopback-interfaces", true,
+                           (NULL == pmix_ptl_base.if_include) ? "NULL" : pmix_ptl_base.if_include,
+                           (NULL == pmix_ptl_base.if_exclude) ? "NULL" : pmix_ptl_base.if_exclude,
+                           prefix);
+        }
         PMIx_Argv_free(candidates);
         free(prefix);
         return PMIX_ERR_SILENT;
@@ -551,6 +731,7 @@ static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_l
                               sizeof(struct sockaddr_storage))) {
         pmix_output(0, "ptl:tcp: problems getting address for kernel index %i\n",
                     pmix_ifindextokindex(saveindex));
+        free(altidx);
         return PMIX_ERR_NOT_AVAILABLE;
     }
 
@@ -565,6 +746,7 @@ static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_l
         /* unrecognized family type - shouldn't be possible as we only
          * included IPv4 and IPv6 interfaces, but this is needed to
          * silence warnings */
+        free(altidx);
         return PMIX_ERR_NOT_SUPPORTED;
     }
 
@@ -711,9 +893,20 @@ static pmix_status_t tcp_setup_listener(pmix_info_t info[], size_t ninfo, pmix_l
     pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
                         "ptl:tcp URI %s", lt->uri);
 
+    /* listen on the other public interfaces too, and record where */
+    if (0 < naltidx) {
+        rc = open_alternates(lt, altidx, naltidx, (uint16_t) myport);
+        free(altidx);
+        altidx = NULL;
+        if (PMIX_SUCCESS != rc) {
+            goto sockerror;
+        }
+    }
+
     return PMIX_SUCCESS;
 
 sockerror:
+    free(altidx);
     CLOSE_THE_SOCKET(lt->socket);
     return rc;
 }

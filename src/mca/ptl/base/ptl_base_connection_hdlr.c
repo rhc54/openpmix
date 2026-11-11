@@ -44,6 +44,7 @@
 #include "src/util/pmix_error.h"
 #include "src/util/pmix_getid.h"
 #include "src/util/pmix_net.h"
+#include "src/util/pmix_random_bytes.h"
 #include "src/util/pmix_show_help.h"
 #include "src/util/pmix_strnlen.h"
 
@@ -188,6 +189,57 @@ pmix_status_t pmix_ptl_base_read_groups(pmix_peer_t *peer)
     return PMIX_SUCCESS;
 }
 
+static pmix_status_t choice_text(pmix_pending_connection_t *pnd, char *msg, size_t *len);
+
+/* The credential of a tool or server on another host: made for this
+ * connection, as a tool, over the two nonces and the choice - see
+ * "Between hosts" in ptl_base_handshake.h. The identity it proves is the
+ * peer's, and must be the user its opening said it runs as */
+static pmix_status_t validate_remote(pmix_pending_connection_t *pnd, pmix_psec_module_t *psec,
+                                     pmix_peer_t *peer, const pmix_byte_object_t *cred)
+{
+    char choice[PMIX_PTL_CHOICE_MAX];
+    size_t clen;
+    pmix_byte_object_t bind = PMIX_BYTE_OBJECT_STATIC_INIT;
+    uid_t uid;
+    gid_t gid;
+    pmix_status_t rc;
+
+    if (NULL == psec || NULL == psec->validate_bound || NULL == peer->info) {
+        return PMIX_ERR_NOT_SUPPORTED;
+    }
+    rc = choice_text(pnd, choice, &clen);
+    if (PMIX_SUCCESS == rc) {
+        rc = pmix_ptl_base_auth_bind(false, pnd->auth_tool, pnd->auth_srv, choice, clen, &bind);
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = psec->validate_bound(&bind, false, cred, &uid, &gid);
+    }
+    PMIX_BYTE_OBJECT_DESTRUCT(&bind);
+    if (PMIX_SUCCESS != rc) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base: the %s credential of a peer at %s on another host does "
+                            "not prove who it is: %s", psec->name,
+                            pmix_net_get_hostname((struct sockaddr *) &pnd->addr),
+                            PMIx_Error_string(rc));
+        return PMIX_ERR_INVALID_CRED;
+    }
+    if (uid != pnd->remote_uid) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base: a peer on another host proved it is uid %lu, not the "
+                            "uid %lu it said", (unsigned long) uid,
+                            (unsigned long) pnd->remote_uid);
+        return PMIX_ERR_INVALID_CRED;
+    }
+    pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                        "ptl:base: a peer at %s on another host proved it is uid %lu gid %lu "
+                        "with %s", pmix_net_get_hostname((struct sockaddr *) &pnd->addr),
+                        (unsigned long) uid, (unsigned long) gid, psec->name);
+    peer->info->uid = uid;
+    peer->info->gid = gid;
+    return PMIX_SUCCESS;
+}
+
 /* Validate the credential the peer sent */
 static pmix_status_t validate(pmix_pending_connection_t *pnd)
 {
@@ -198,8 +250,9 @@ static pmix_status_t validate(pmix_pending_connection_t *pnd)
 
     /* A peer that connected over TCP from an address that is not this
      * host's is on another host, or in another network namespace: this
-     * server takes only peers on its own host */
-    if (!local_peer(pnd) && !pmix_ptl_base_addr_on_host(&pnd->addr)) {
+     * server takes such a peer only by the exchange between hosts, which
+     * it has been through when `remote` is set */
+    if (!local_peer(pnd) && !pnd->remote && !pmix_ptl_base_addr_on_host(&pnd->addr)) {
         pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
                             "ptl:base: refusing a peer at %s, not on this host",
                             pmix_net_get_hostname((struct sockaddr *) &pnd->addr));
@@ -208,6 +261,9 @@ static pmix_status_t validate(pmix_pending_connection_t *pnd)
 
     cred.bytes = pnd->cred;
     cred.size = pnd->len;
+    if (pnd->remote) {
+        return validate_remote(pnd, psec, peer, &cred);
+    }
     peer->sd = pnd->sd;
     /* the process's groups, as the kernel has them now */
     rc = pmix_ptl_base_read_groups(peer);
@@ -878,7 +934,13 @@ static pmix_status_t choose(pmix_pending_connection_t *pnd, char **psecs, char *
     int i;
 
     PMIX_LIST_FOREACH (active, &pmix_psec_globals.actives, pmix_psec_base_active_module_t) {
-        if (offered(psecs, active->module->name)) {
+        /* a peer on another host proves who it is with a credential made
+         * for the one connection, which only some mechanisms make */
+        /* and only one that can check the peer's credential - a module
+         * may make credentials with nothing to check another's against */
+        if (offered(psecs, active->module->name) &&
+            (NULL == active->module->validates || active->module->validates()) &&
+            (!pnd->remote || pmix_psec_base_remote_capable(active->module))) {
             pnd->psecmod = active->module;
             break;
         }
@@ -890,7 +952,10 @@ static pmix_status_t choose(pmix_pending_connection_t *pnd, char **psecs, char *
         return PMIX_ERR_NOT_SUPPORTED;
     }
 
-    if ('\0' != pnd->proc.nspace[0]) {
+    /* a peer on another host has proved nothing yet: it is not taken to
+     * be of the namespace it names, whose wire format the host later
+     * checks it against */
+    if ('\0' != pnd->proc.nspace[0] && !pnd->remote) {
         nptr = find_nspace(pnd->proc.nspace);
     }
     if (NULL != nptr && !of_namespace(pnd, nptr)) {
@@ -927,6 +992,10 @@ static pmix_status_t choose(pmix_pending_connection_t *pnd, char **psecs, char *
     }
 
     for (i = 0; NULL != gdss && NULL != gdss[i]; i++) {
+        /* shared memory does not reach another host */
+        if (pnd->remote && 0 != strcmp(gdss[i], PMIX_PTL_REMOTE_GDS)) {
+            continue;
+        }
         gds = gds_named(gdss[i]);
         if (NULL != gds) {
             pnd->gdsmod = gds;
@@ -950,28 +1019,99 @@ static pmix_status_t choose(pmix_pending_connection_t *pnd, char **psecs, char *
     return PMIX_SUCCESS;
 }
 
-/* Send the choice: a status of success, then its length and the names */
-static pmix_status_t send_choice(pmix_pending_connection_t *pnd)
+/* The choice as it goes on the wire after its length: the names, with the
+ * buffer type after the wire format's. *len is its length */
+static pmix_status_t choice_text(pmix_pending_connection_t *pnd, char *msg, size_t *len)
 {
-    char msg[2 * sizeof(uint32_t) + PMIX_PTL_CHOICE_MAX];
-    size_t csize = 2 * sizeof(uint32_t), len;
-    uint32_t u32;
+    size_t csize = 0;
     uint8_t bt = pnd->buffer_type;
 
-    len = strlen(pnd->psec) + 1 + strlen(pnd->bfrops) + 1 + 1 + strlen(pnd->gds) + 1;
-    if (PMIX_PTL_CHOICE_MAX < len) {
+    *len = strlen(pnd->psec) + 1 + strlen(pnd->bfrops) + 1 + 1 + strlen(pnd->gds) + 1;
+    if (PMIX_PTL_CHOICE_MAX < *len) {
         return PMIX_ERR_BAD_PARAM;
     }
-    memset(msg, 0, sizeof(msg));
-    u32 = htonl((uint32_t) PMIX_SUCCESS);
-    memcpy(msg, &u32, sizeof(uint32_t));
-    u32 = htonl((uint32_t) len);
-    memcpy(msg + sizeof(uint32_t), &u32, sizeof(uint32_t));
+    memset(msg, 0, PMIX_PTL_CHOICE_MAX);
     PMIX_PTL_PUT_STRING(pnd->psec);
     PMIX_PTL_PUT_STRING(pnd->bfrops);
     PMIX_PTL_PUT_U8(bt);
     PMIX_PTL_PUT_STRING(pnd->gds);
-    return pmix_ptl_base_send_blocking(pnd->sd, msg, csize);
+    return PMIX_SUCCESS;
+}
+
+/* Send the choice: a status of success, then its length and the names */
+static pmix_status_t send_choice(pmix_pending_connection_t *pnd)
+{
+    char msg[2 * sizeof(uint32_t) + PMIX_PTL_CHOICE_MAX];
+    size_t len;
+    uint32_t u32;
+    pmix_status_t rc;
+
+    rc = choice_text(pnd, msg + 2 * sizeof(uint32_t), &len);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    u32 = htonl((uint32_t) PMIX_SUCCESS);
+    memcpy(msg, &u32, sizeof(uint32_t));
+    u32 = htonl((uint32_t) len);
+    memcpy(msg + sizeof(uint32_t), &u32, sizeof(uint32_t));
+    return pmix_ptl_base_send_blocking(pnd->sd, msg, 2 * sizeof(uint32_t) + len);
+}
+
+/* The offer, after whatever comes before it: who the peer is, and the
+ * components it has. *mgp and *cntp are left after the last list; the
+ * caller says whether anything may follow it */
+static pmix_status_t parse_offer(pmix_pending_connection_t *pnd, char **mgp, size_t *cntp,
+                                 char ***psecs, char ***bfrops, char ***gdss)
+{
+    char *mg = *mgp;
+    size_t cnt = *cntp;
+    uint8_t major, minor, release, bt;
+    bool named;
+    pmix_status_t rc;
+
+    PMIX_PTL_GET_STRING(pnd->version);
+    rc = pmix_ptl_base_parse_version(pnd->version, &major, &minor, &release);
+    if (PMIX_SUCCESS != rc || PMIX_PTL_LOCAL_MAJOR > major) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base: refusing a peer of release \"%s\" - its offer is "
+                            "this release's", pnd->version);
+        return PMIX_ERR_NOT_SUPPORTED;
+    }
+    PMIX_SET_PROC_MAJOR(&pnd->proc_type, major);
+    PMIX_SET_PROC_MINOR(&pnd->proc_type, minor);
+    PMIX_SET_PROC_RELEASE(&pnd->proc_type, release);
+
+    PMIX_PTL_GET_U8(pnd->flag);
+    if (!offer_type(pnd, &named)) {
+        return PMIX_ERR_NOT_SUPPORTED;
+    }
+    if (named) {
+        PMIX_PTL_GET_PROCID(pnd->proc);
+    }
+    rc = check_named(pnd);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+
+    rc = offer_list(&mg, &cnt, psecs);
+    if (PMIX_SUCCESS == rc) {
+        rc = offer_list(&mg, &cnt, bfrops);
+    }
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    PMIX_PTL_GET_U8(bt);
+    pnd->buffer_type = bt;
+    rc = offer_list(&mg, &cnt, gdss);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    *mgp = mg;
+    *cntp = cnt;
+    return PMIX_SUCCESS;
+
+error:
+    return PMIX_ERR_BAD_PARAM;
 }
 
 /* A local-socket peer's offer: who it is, and the components it has. The
@@ -981,11 +1121,9 @@ static pmix_status_t answer_offer(pmix_pending_connection_t *pnd, char *msg, siz
     char *mg = msg;
     size_t cnt = len;
     char **psecs = NULL, **bfrops = NULL, **gdss = NULL;
-    uint8_t major, minor, release, bt;
     uid_t kuid;
     gid_t kgid;
     pid_t kpid;
-    bool named;
     pmix_status_t rc;
 
     if (PMIX_SUCCESS != pnd->transport->peer_identity(pnd->sd, &kuid, &kgid, &kpid)) {
@@ -1009,62 +1147,165 @@ static pmix_status_t answer_offer(pmix_pending_connection_t *pnd, char *msg, siz
     pnd->uid = kuid;
     pnd->gid = kgid;
 
-    PMIX_PTL_GET_STRING(pnd->version);
-    rc = pmix_ptl_base_parse_version(pnd->version, &major, &minor, &release);
-    if (PMIX_SUCCESS != rc || PMIX_PTL_LOCAL_MAJOR > major) {
-        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
-                            "ptl:base: refusing a peer of release \"%s\" on the local socket",
-                            pnd->version);
-        return PMIX_ERR_NOT_SUPPORTED;
-    }
-    PMIX_SET_PROC_MAJOR(&pnd->proc_type, major);
-    PMIX_SET_PROC_MINOR(&pnd->proc_type, minor);
-    PMIX_SET_PROC_RELEASE(&pnd->proc_type, release);
-
-    PMIX_PTL_GET_U8(pnd->flag);
-    if (!offer_type(pnd, &named)) {
-        return PMIX_ERR_NOT_SUPPORTED;
-    }
-    if (named) {
-        PMIX_PTL_GET_PROCID(pnd->proc);
-    }
-    rc = check_named(pnd);
-    if (PMIX_SUCCESS != rc) {
-        return rc;
-    }
-
-    rc = offer_list(&mg, &cnt, &psecs);
-    if (PMIX_SUCCESS == rc) {
-        rc = offer_list(&mg, &cnt, &bfrops);
-    }
-    if (PMIX_SUCCESS != rc) {
-        goto done;
-    }
-    rc = PMIX_ERR_BAD_PARAM;
-    PMIX_PTL_GET_U8(bt);
-    pnd->buffer_type = bt;
-    rc = offer_list(&mg, &cnt, &gdss);
-    if (PMIX_SUCCESS != rc) {
-        goto done;
-    }
-    if (0 != cnt) {
+    rc = parse_offer(pnd, &mg, &cnt, &psecs, &bfrops, &gdss);
+    if (PMIX_SUCCESS == rc && 0 != cnt) {
         rc = PMIX_ERR_BAD_PARAM;
-        goto done;
     }
-
-    rc = choose(pnd, psecs, bfrops, gdss);
+    if (PMIX_SUCCESS == rc) {
+        rc = choose(pnd, psecs, bfrops, gdss);
+    }
     if (PMIX_SUCCESS == rc) {
         rc = send_choice(pnd);
     }
+    PMIx_Argv_free(psecs);
+    PMIx_Argv_free(bfrops);
+    PMIx_Argv_free(gdss);
+    return rc;
+}
+
+/* Whether a TCP connect-ack is the opening of a tool or server on another
+ * host: an empty credential and the flag PMIX_REMOTE_TOOL where the
+ * connector kind goes. *off is where its offer begins */
+static bool remote_opening(char *msg, size_t len, size_t *off)
+{
+    char *mg = msg, *sec = NULL;
+    size_t cnt = len;
+    uint32_t clen = UINT32_MAX;
+    uint8_t flag = 0;
+
+    PMIX_PTL_GET_STRING(sec);
+    free(sec);
+    PMIX_PTL_GET_U32(clen);
+    PMIX_PTL_GET_U8(flag);
+    if (0 != clen || PMIX_REMOTE_TOOL != flag) {
+        return false;
+    }
+    *off = len - cnt;
+    return true;
+
+error:
+    return false;
+}
+
+/* The opening of a tool, launcher, scheduler or server on another host -
+ * see "Between hosts" in ptl_base_handshake.h. Nothing it claims is its
+ * identity: that is what its credential proves, once it has sent one.
+ * The server proves who it is first, in its answer */
+static pmix_status_t answer_remote(pmix_pending_connection_t *pnd, char *msg, size_t len)
+{
+#if PMIX_ENABLE_REMOTE_TOOLS
+    char *mg = msg;
+    size_t cnt = len, clen, csize;
+    char **psecs = NULL, **bfrops = NULL, **gdss = NULL;
+    char choice[PMIX_PTL_CHOICE_MAX], *out = NULL, *nonce = NULL;
+    pmix_byte_object_t bind = PMIX_BYTE_OBJECT_STATIC_INIT;
+    pmix_byte_object_t cred = PMIX_BYTE_OBJECT_STATIC_INIT;
+    pmix_psec_module_t *psec;
+    uint32_t u32 = 0;
+    pmix_status_t rc;
+
+    if (!pmix_ptl_base.remote_tools) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base: refusing a tool on another host - this server does not "
+                            "take them");
+        return PMIX_ERR_NOT_SUPPORTED;
+    }
+    /* who it is, if it proves it, is unknown until then */
+    pnd->uid = (uid_t) -1;
+    pnd->gid = (gid_t) -1;
+    pnd->remote = true;
+
+    rc = parse_offer(pnd, &mg, &cnt, &psecs, &bfrops, &gdss);
+    if (PMIX_SUCCESS != rc) {
+        goto done;
+    }
+    /* only a process that is not a client comes this way: a client's
+     * registration names it to its own host's server */
+    switch (pnd->flag) {
+    case PMIX_TOOL_NEEDS_ID:
+    case PMIX_TOOL_GIVEN_ID:
+    case PMIX_LAUNCHER_NEEDS_ID:
+    case PMIX_LAUNCHER_GIVEN_ID:
+    case PMIX_SCHEDULER_WITH_ID:
+        break;
+    default:
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base: refusing a connector of kind %u from another host - "
+                            "only tools and servers connect from one", (unsigned) pnd->flag);
+        rc = PMIX_ERR_NOT_SUPPORTED;
+        goto done;
+    }
+    rc = PMIX_ERR_BAD_PARAM;
+    PMIX_PTL_GET_BLOB(nonce, PMIX_PTL_AUTH_NONCE_LEN);
+    memcpy(pnd->auth_tool, nonce, PMIX_PTL_AUTH_NONCE_LEN);
+    PMIX_PTL_GET_U32(u32);
+    pnd->remote_uid = (uid_t) u32;
+    /* anything after that is a later release's */
+
+    rc = choose(pnd, psecs, bfrops, gdss);
+    if (PMIX_SUCCESS != rc) {
+        goto done;
+    }
+    psec = (pmix_psec_module_t *) pnd->psecmod;
+
+    /* prove who we are: a credential, as a server, bound to both nonces
+     * and to the choice, for the user the tool says it runs as - who
+     * alone can then check it, where the mechanism can say so */
+    rc = pmix_util_random_bytes(pnd->auth_srv, PMIX_PTL_AUTH_NONCE_LEN);
+    if (PMIX_SUCCESS == rc) {
+        rc = choice_text(pnd, choice, &clen);
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = pmix_ptl_base_auth_bind(true, pnd->auth_tool, pnd->auth_srv, choice, clen, &bind);
+    }
+    if (PMIX_SUCCESS == rc) {
+        rc = psec->create_bound(&bind, true, pnd->remote_uid, &cred);
+    }
+    if (PMIX_SUCCESS == rc && (0 == cred.size || PMIX_MAX_CRED_SIZE < cred.size)) {
+        rc = PMIX_ERR_BAD_PARAM;
+    }
+    if (PMIX_SUCCESS != rc) {
+        pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                            "ptl:base: could not make a %s credential for a tool on another "
+                            "host: %s", psec->name, PMIx_Error_string(rc));
+        goto done;
+    }
+
+    /* the status, the choice, our nonce and our credential */
+    out = (char *) malloc(3 * sizeof(uint32_t) + clen + PMIX_PTL_AUTH_NONCE_LEN + cred.size);
+    if (NULL == out) {
+        rc = PMIX_ERR_NOMEM;
+        goto done;
+    }
+    msg = out;
+    csize = 0;
+    PMIX_PTL_PUT_U32(PMIX_SUCCESS);
+    PMIX_PTL_PUT_U32(clen);
+    PMIX_PTL_PUT_BLOB(choice, clen);
+    PMIX_PTL_PUT_BLOB(pnd->auth_srv, PMIX_PTL_AUTH_NONCE_LEN);
+    PMIX_PTL_PUT_U32(cred.size);
+    PMIX_PTL_PUT_BLOB(cred.bytes, cred.size);
+    rc = pmix_ptl_base_send_blocking(pnd->sd, out, csize);
     goto done;
 
 error:
     rc = PMIX_ERR_BAD_PARAM;
 done:
+    free(out);
+    free(nonce);
+    PMIX_BYTE_OBJECT_DESTRUCT(&bind);
+    PMIX_BYTE_OBJECT_DESTRUCT(&cred);
     PMIx_Argv_free(psecs);
     PMIx_Argv_free(bfrops);
     PMIx_Argv_free(gdss);
     return rc;
+#else
+    PMIX_HIDE_UNUSED_PARAMS(pnd, msg, len);
+    pmix_output_verbose(2, pmix_ptl_base_framework.framework_output,
+                        "ptl:base: refusing a tool on another host - this PMIx was built "
+                        "without support for them");
+    return PMIX_ERR_NOT_SUPPORTED;
+#endif
 }
 
 /* A local-socket peer's second message: the credential, and the info,
@@ -1107,7 +1348,7 @@ void pmix_ptl_base_connection_handler(int sd, short args, void *cbdata)
     pmix_pending_connection_t *pnd = (pmix_pending_connection_t *) cbdata;
     pmix_status_t rc, vrc;
     char *msg = NULL, *mg;
-    size_t cnt;
+    size_t cnt, off = 0;
     uint8_t major, minor, release;
 
     /* acquire the object */
@@ -1138,9 +1379,12 @@ void pmix_ptl_base_connection_handler(int sd, short args, void *cbdata)
         pmix_ptl_base_drop_pending_connection(pnd, PMIX_ERR_OUT_OF_RESOURCE);
         return;
     }
-    if (PMIX_SUCCESS == rc && local_peer(pnd) && !pnd->offered) {
-        /* a local-socket peer's offer: answer it with the server's choice,
-         * and wait - under the same deadline - for its credential */
+    if (PMIX_SUCCESS == rc && !pnd->offered &&
+        (local_peer(pnd) || remote_opening(pnd->msg, pnd->hdr.nbytes, &off))) {
+        /* a local-socket peer's offer, or the opening of a tool or server
+         * on another host: answer it with the server's choice - and to the
+         * latter prove who we are - and wait, under the same deadline,
+         * for its credential */
         msg = pnd->msg;
         pnd->msg = NULL;
         cnt = pnd->hdr.nbytes;
@@ -1148,7 +1392,11 @@ void pmix_ptl_base_connection_handler(int sd, short args, void *cbdata)
         pnd->msg_recvd = 0;
         pnd->hdr_recvd = 0;
         memset(&pnd->hdr, 0, sizeof(pnd->hdr));
-        rc = answer_offer(pnd, msg, cnt);
+        if (local_peer(pnd)) {
+            rc = answer_offer(pnd, msg, cnt);
+        } else {
+            rc = answer_remote(pnd, msg + off, cnt - off);
+        }
         pmix_ptl_base_wipe(msg, cnt);
         free(msg);
         msg = NULL;
@@ -1205,8 +1453,9 @@ void pmix_ptl_base_connection_handler(int sd, short args, void *cbdata)
     cnt = pnd->hdr.nbytes;
     mg = msg;
 
-    if (local_peer(pnd)) {
-        /* the credential that follows a local-socket peer's offer */
+    if (local_peer(pnd) || pnd->remote) {
+        /* the credential that follows a local-socket peer's offer, or a
+         * remote peer's opening */
         rc = read_credential(pnd, msg, cnt);
         pmix_ptl_base_wipe(msg, pnd->hdr.nbytes);
         free(msg);

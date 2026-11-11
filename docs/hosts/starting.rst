@@ -106,8 +106,9 @@ Three things, and the host controls only one:
 #. The support turned on: the host passes ``PMIX_SERVER_LEGACY_PEERS``
    set true, or passes nothing and the site sets
    ``ptl_base_legacy_clients``.
-#. The server listens for them on a loopback interface, so they must be
-   on its host - as every client and tool must.
+#. The server listens for them on a loopback interface - or, when it
+   takes tools on other hosts, its public interfaces, whose addresses
+   are its host's - so they must be on its host, as every client must.
 
 The attribute overrides the site's parameter in both directions. A host
 that passes it false turns the support off even where the site asked
@@ -120,6 +121,35 @@ Without all three, a client of an earlier release - an Open MPI 5
 process, say - runs as a singleton, and a tool of an earlier release
 cannot connect. See :ref:`clients of earlier releases
 <label-conn-earlier-clients>`.
+
+
+Serve tools on other hosts
+--------------------------
+
+A tool, launcher or scheduler on another node - ``prun`` or a debugger
+on a login node reaching a DVM on the compute nodes - or a server
+reaching a scheduler on another node. Four things:
+
+#. PMIx configured ``--enable-remote-tools``, with ``--with-munge`` or
+   ``--with-openssl``; it is off by default.
+#. The support turned on: the host passes
+   ``PMIX_SERVER_REMOTE_CONNECTIONS`` set true, or passes nothing and
+   the site sets ``ptl_base_remote_tools``. The attribute overrides the
+   parameter in both directions.
+#. ``munge`` running with a key the nodes share, or ``ssl`` given a
+   certificate, key and CA on each end (``psec_ssl_*``). A server with
+   neither fails ``PMIx_server_init``.
+#. ``PMIX_SERVER_TOOL_SUPPORT``, which a scheduler and a system
+   controller imply. A tool of another user also needs
+   ``PMIX_SERVER_ALLOW_FOREIGN_TOOLS``, as one on the host does.
+
+The server then listens on its public interfaces: the first gives its
+TCP URI, and the others are stored, comma-separated, under
+``PMIX_MYSERVER_ALT_URIS`` and written on an ``alturis:`` line of its
+files. Give a tool the TCP URI (``PMIX_SERVER_URI``), with the others as
+``PMIX_SERVER_ALT_URIS``, or the server's report file copied to the
+tool's node. Clients and processes of earlier releases never connect
+this way. See :ref:`label-conn-between-hosts`.
 
 
 Report the server's address
@@ -154,9 +184,9 @@ See :ref:`PMIx_server_init(3) <man3-PMIx_server_init>` ("The tmpdirs").
 What not to pass
 ----------------
 
-* ``PMIX_SERVER_REMOTE_CONNECTIONS`` set true fails
-  ``PMIx_server_init``: a server takes connections from its own host
-  only.
+* ``PMIX_SERVER_REMOTE_CONNECTIONS`` set true in a PMIx not configured
+  ``--enable-remote-tools``, or where neither ``munge`` nor ``ssl`` can
+  make a credential for one connection, fails ``PMIx_server_init``.
 * After a failed ``PMIx_server_init``, do not call
   ``PMIx_server_finalize``. Correct what was refused and call
   ``PMIx_server_init`` again.

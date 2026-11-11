@@ -892,10 +892,11 @@ AC_DEFUN([PMIX_SETUP_CORE],[
 
     # Every process of this release on a host connects to its server over
     # the usock transport, and tcp carries every connection with a peer of
-    # an earlier release - so tcp is needed whenever either direction of
-    # legacy support is built. Neither can then be left out.
+    # an earlier release or a tool on another host - so tcp is needed
+    # whenever either direction of legacy support, or remote tools, is
+    # built. Neither can then be left out.
     pmix_ptl_required_list=usock
-    AS_IF([test "$pmix_legacy_support" = "1"],
+    AS_IF([test "$pmix_tcp_transport" = "1"],
           [pmix_ptl_required_list="$pmix_ptl_required_list tcp"])
     for pmix_ptl_required in $pmix_ptl_required_list ; do
         AS_CASE([" $MCA_pmix_ptl_STATIC_COMPONENTS $MCA_pmix_ptl_DSO_COMPONENTS "],
@@ -905,6 +906,23 @@ AC_DEFUN([PMIX_SETUP_CORE],[
                  AC_MSG_WARN([--enable-mca-no-build.])
                  AC_MSG_ERROR([Cannot continue])])
     done
+
+    # A tool on another host authenticates itself, and the server it
+    # connects to, with munge or ssl: native asks this host's kernel, which
+    # knows nothing of a process on another host. A build that takes
+    # remote tools needs one of them.
+    AS_IF([test "$pmix_remote_tools" = "1"],
+          [pmix_remote_psec=no
+           for pmix_psec_remote in munge ssl ; do
+               AS_CASE([" $MCA_pmix_psec_STATIC_COMPONENTS $MCA_pmix_psec_DSO_COMPONENTS "],
+                       [*" $pmix_psec_remote "*], [pmix_remote_psec=yes])
+           done
+           AS_IF([test "$pmix_remote_psec" = "no"],
+                 [AC_MSG_WARN([--enable-remote-tools was given, but neither the munge nor the])
+                  AC_MSG_WARN([ssl security component is being built. A tool on another host])
+                  AC_MSG_WARN([and its server authenticate each other with one of them.])
+                  AC_MSG_WARN([Configure with --with-munge or --with-openssl as well.])
+                  AC_MSG_ERROR([Cannot continue])])])
 
 
     ############################################################################
@@ -1586,6 +1604,45 @@ AC_DEFINE_UNQUOTED([PMIX_ENABLE_LEGACY_SUPPORT], [$pmix_legacy_support],
 
 PMIX_SUMMARY_ADD([Miscellaneous], [Earlier-release clients and tools], [], [$enable_legacy_clients])
 PMIX_SUMMARY_ADD([Miscellaneous], [Earlier-release servers], [], [$enable_legacy_servers])
+
+#
+# Do we want to build support for tools on other hosts? A tool of this
+# release on one host - prun or a debugger on a login node - connecting
+# over TCP to a server on another, such as a DVM or a scheduler, or a
+# server connecting to a scheduler on another host. The kernel there
+# names neither end, so the two authenticate each other with munge or
+# ssl - checked once the components are configured, in PMIX_SETUP_CORE.
+# Without it a server takes connections from its own host only, and a
+# host that asks for remote connections fails its init. Only tools and
+# servers come this way: a client is refused.
+#
+AC_MSG_CHECKING([if want support for remote tools])
+AC_ARG_ENABLE([remote-tools],
+    [AS_HELP_STRING([--enable-remote-tools],
+        [Build support for tools on other hosts connecting to a PMIx server over TCP, which requires --with-munge or --with-openssl: a tool on another host and its server authenticate each other with munge or ssl. With it, the ptl_base_remote_tools parameter or the PMIX_SERVER_REMOTE_CONNECTIONS attribute turns it on (default: disabled)])])
+if test "$enable_remote_tools" = "yes"; then
+    AC_MSG_RESULT([yes])
+    pmix_remote_tools=1
+    pmix_remote_tools_msg=yes
+else
+    AC_MSG_RESULT([no])
+    pmix_remote_tools=0
+    pmix_remote_tools_msg=no
+fi
+AC_DEFINE_UNQUOTED([PMIX_ENABLE_REMOTE_TOOLS], [$pmix_remote_tools],
+                   [Whether a server can take connections from tools on other hosts, and a tool or server can connect to one])
+
+PMIX_SUMMARY_ADD([Miscellaneous], [Remote tools], [], [$pmix_remote_tools_msg])
+
+# the tcp transport carries both legacy peers and tools on other hosts -
+# see its configure.m4
+if test "$pmix_legacy_support" = "1" || test "$pmix_remote_tools" = "1"; then
+    pmix_tcp_transport=1
+else
+    pmix_tcp_transport=0
+fi
+AC_DEFINE_UNQUOTED([PMIX_ENABLE_TCP_TRANSPORT], [$pmix_tcp_transport],
+                   [Whether the tcp transport is built: for legacy peers, tools on other hosts, or both])
 
 ])dnl
 

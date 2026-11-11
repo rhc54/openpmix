@@ -52,7 +52,7 @@ The pieces
        ``ptl_base_fns.c``, ``src/mca/ptl/base/ptl_base_client.c``
      - Builds and sends the connection request, reads the replies.
    * - Security (``psec``)
-     - ``src/mca/psec/{native,munge}``
+     - ``src/mca/psec/{native,munge,ssl}``
      - Creates a credential on the connecting side; checks it, and runs
        any further exchange, on the server.
    * - Host up-calls
@@ -138,11 +138,13 @@ this release on its host connects. It listens on **TCP** only for those
 who use it: clients and tools of earlier releases, when it takes them
 (``ptl_base_legacy_clients``, or the host's ``PMIX_SERVER_LEGACY_PEERS``;
 off by default, and only in a PMIx configured
-``--enable-legacy-clients``). A server takes connections from its own host only: a
-host that asks for connections from other hosts
-(``PMIX_SERVER_REMOTE_CONNECTIONS`` set to true) fails
-``PMIx_server_init``. A server that cannot open a socket it needs fails
-``PMIx_server_init`` too.
+``--enable-legacy-clients``), and tools and servers of this release on
+other hosts, when it takes them (``ptl_base_remote_tools``, or the
+host's ``PMIX_SERVER_REMOTE_CONNECTIONS``; off by default, and only in a
+PMIx configured ``--enable-remote-tools`` - see `A server on another
+host`_). Otherwise it takes connections from its own host only. Asking
+for either in a build without it fails ``PMIx_server_init``, and so
+does a server that cannot open a socket it needs.
 
 .. _label-conn-earlier-clients:
 
@@ -204,10 +206,17 @@ For TCP, the server considers each network interface that has an IPv4 address
 (or IPv6, if enabled), skipping any the ``if_include`` / ``if_exclude``
 settings rule out. Then:
 
-* **It listens on loopback only.** Only processes on the same node can
-  reach it.
-* **With no loopback interface left,** it fails its init. It never
-  takes a public interface instead.
+* **By default it listens on loopback only.** Only processes on the
+  same node can reach it. With no loopback interface left, it fails its
+  init; it never takes a public interface instead.
+* **When it takes tools on other hosts,** it listens on the first
+  public interface the settings leave, and on every other public
+  interface as well. The first gives the URI; the others are
+  *alternate* addresses, each with a listener of its own (on the same
+  port where it is free), so a tool that cannot reach the first may
+  reach another. With no public interface left, it fails its init
+  (help topic ``no-remote-interfaces``). Processes of earlier releases
+  on the same node reach the public address, which is the node's own.
 
 The port is the first free one from ``ptl_base_ipv4_ports`` (or the
 ``PMIX_TCP_IPV4_PORT`` directive), and by default is chosen by the
@@ -234,7 +243,11 @@ server's address to a process of a release before v7.0, use
 ``PMIX_SERVER_URI`` instead. When the
 server has one, the local socket's URI is given beside it where a
 process on the host reads it: the environment of the processes the
-server starts (see below) and the rendezvous files.
+server starts (see below) and the rendezvous files. Any alternate
+addresses go, comma-separated, under ``PMIX_MYSERVER_ALT_URIS``, and on
+an ``alturis:`` line of the rendezvous and report files, after the
+lines every release reads by position. The URI itself never carries
+more than one address: every released parser refuses one that does.
 
 The server can also report the URI on request (``ptl_base_report_uri``
 or the ``PMIX_TCP_REPORT_URI`` directive):
@@ -432,25 +445,32 @@ progress thread, without blocking it.
 A client takes the local socket's URI from its environment (or a URI
 from a ``PMIX_SERVER_URI`` directive to ``PMIx_Init``). A tool finds its
 server as described in :doc:`ptl`; a rendezvous file of this release
-gives it the local socket. A tool given a TCP URI directly
-(``PMIX_SERVER_URI`` or ``PMIX_TCP_URI``, or the launcher's
+gives it the local socket. A tool given a TCP URI of its own host
+directly (``PMIX_SERVER_URI`` or ``PMIX_TCP_URI``, or the launcher's
 ``PMIX_LAUNCHER_RNDZ_URI``) does not connect, and fails with
 ``PMIX_ERR_NOT_SUPPORTED`` (help topic ``tcp-uri-alone``): a server of
 this release takes it on its local socket, and one of an earlier
 release through its rendezvous file (``file:<path>``), which gives the
-server's version. From there the two do the same:
+server's version. A TCP URI of another host is taken, in a PMIx
+configured ``--enable-remote-tools`` (see `A server on another host`_).
+From there the two do the same:
 
-#. **Open a connection** to the URI's address - only an address of this
-   host. A TCP address that is not this host's - not a loopback address,
-   and not an address one of its interfaces holds, by the interface list
-   PMIx made at init or by the kernel's own list - is not dialled, and
-   the process says why. A tool fails with ``PMIX_ERR_UNREACH``; a
-   client, which was told where its server is, fails ``PMIx_Init`` with
-   ``PMIX_ERR_COMM_FAILURE`` rather than coming up as a singleton. Each attempt
-   is bounded by ``ptl_base_handshake_wait_time`` (default 60 seconds).
+#. **Open a connection** to the URI's address. A TCP address that is
+   not this host's - not a loopback address, and not an address one of
+   its interfaces holds, by the interface list PMIx made at init or by
+   the kernel's own list - is dialled only by a tool, launcher,
+   scheduler or server in a PMIx configured ``--enable-remote-tools``,
+   which then tries each alternate address it was given if that one
+   does not answer. Otherwise it is not dialled, and the process says
+   why. A tool fails with ``PMIX_ERR_UNREACH``; a client, which was told
+   where its server is, fails ``PMIx_Init`` with ``PMIX_ERR_COMM_FAILURE``
+   rather than coming up as a singleton (help topic
+   ``remote-not-tool`` where remote tools are built). Each attempt is
+   bounded by ``ptl_base_handshake_wait_time`` (default 60 seconds).
    A process given the local socket connects there and nowhere else: if
    it cannot reach the socket, it fails to initialize, and says why.
-#. **Check the server** (below).
+#. **Check the server** (below) - or, on another host, have it prove
+   who it is (see `A server on another host`_).
 #. **Send the connection request.** On the local socket that is an
    offer, answered by the server's choice, and then the credential (see
    `The connection request`_). Each send is bounded by
@@ -567,6 +587,80 @@ server run by a service account.
 A process of an earlier release does none of this; the server checks it
 as any other process on its host - see :doc:`authentication/native`
 for a platform with no table.
+
+.. _label-conn-between-hosts:
+
+A server on another host
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+In a PMIx configured ``--enable-remote-tools`` (which requires
+``--with-munge`` or ``--with-openssl``), a tool, launcher or scheduler of
+this release - or a server, reaching a scheduler, say - connects over TCP
+to a server on another host whose host takes them
+(``PMIX_SERVER_REMOTE_CONNECTIONS``, or ``ptl_base_remote_tools``). The
+kernel on neither host names the other end, so the two prove who they
+are to each other, the server first, with ``munge`` or ``ssl``.
+``native`` cannot take part. The exchange is the local socket's offer,
+choice and credential (see `The connection request`_), run over TCP:
+
+#. **The process opens** with the first fields of a TCP connection
+   request - an empty security name, a zero credential length, and the
+   kind of peer ``11`` - so that a server that does not take part, of
+   this release or an earlier one, refuses it as a kind it does not
+   know. Then comes its offer, as on the local socket, naming only the
+   mechanisms it has that can make a credential for one connection and
+   the ``hash`` datastore (shared memory does not reach another host);
+   then a random value of its own (a *nonce*) and its uid. A server
+   ignores anything after that, which a later release may append. A
+   process with neither ``munge`` nor ``ssl`` configured sends nothing
+   and fails, saying so (help topic ``remote-no-psec-tool``). For
+   ``ssl`` that means a certificate and key of its own and the
+   certificate authority the server's certificate is issued by.
+#. **The server answers** with a status. It refuses a server that does
+   not take tools from other hosts, a kind of peer other than a tool or
+   launcher (asking for an identity or given one) or a scheduler - a
+   client, a singleton, a tool or launcher a server started under a
+   registered rank - and an offer naming no mechanism it can use this
+   way. Otherwise the answer is its choice, then a nonce of its own, the
+   length of a credential, and that credential: made for this
+   connection as a server's, bound to both nonces and to the choice, and
+   naming who the server is. With ``munge``, only a process of the uid
+   the opening named can decode it.
+#. **The process checks that credential**, and then whom it names: the
+   uid and gid it was given for the server, if it was, else its own
+   user, root, or one ``ptl_base_server_access`` names. A server that
+   fails either check is not talked to (help topics
+   ``remote-server-unproven``, ``server-identity-remote``).
+#. **Its credential message then carries a credential made for this
+   connection too**, as a tool's, bound to the same nonces and choice -
+   with ``munge``, decodable only by the server's uid. The server takes
+   the process's uid and gid from it, and refuses a uid other than the
+   one the opening named. Neither credential is accepted for any other
+   connection, nor by ``PMIx_Validate_credential``.
+
+Nothing either end claims is believed: each is who its credential
+proves. From there the server treats the process as any tool: its host
+must take tools (``PMIX_SERVER_TOOL_SUPPORT``; a scheduler and a system
+controller do unless told not to), a tool of another user is refused
+unless the host allows foreign tools, and the host decides. A server of
+a release before this one does not take part, and a process of this
+release does not reach one on another host. For ``ssl``, a server's
+certificate must allow server authentication and a process's client
+authentication, where they restrict their key's use; and the user each
+certificate names must be a user of the other end's host, with the same
+uid, holding the group the credential claims.
+
+A process finds such a server from its URI given directly
+(``PMIX_SERVER_URI``, ``PMIX_TCP_URI``) - with any alternates in
+``PMIX_SERVER_ALT_URIS`` - or from the server's report or rendezvous
+file copied from its host, whose first line is the TCP URI and whose
+``alturis:`` line lists the alternates. The file's ``local:`` line is
+used only on the server's own host.
+
+What the exchange establishes is who is at each end when the connection
+opens: the server's user to the process, and the process's to the
+server. It does not establish which host or address the process
+reached, and the traffic after it is neither encrypted nor signed.
 
 The connection request
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -804,7 +898,9 @@ peer:
 Before the security component is asked, a peer that connected over TCP
 from an address that is not this host's - not a loopback address, and
 not the address of one of its interfaces - is refused with
-``PMIX_ERR_NO_PERMISSIONS``. A server takes peers on its own host only.
+``PMIX_ERR_NO_PERMISSIONS``, unless it opened with the exchange between
+hosts (see `A server on another host`_), which proves who it is
+whatever its address.
 
 The rest depends on whether the peer is a client (kinds 0 and 9) or a
 tool (all the others).

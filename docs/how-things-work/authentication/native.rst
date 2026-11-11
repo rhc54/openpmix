@@ -5,7 +5,9 @@ The ``native`` Mechanism
 daemon, library, or key. It establishes the user ID (uid) and group ID
 (gid) of a peer through the kernel of the host the server runs on, so it
 serves peers on that host only |mdash| including peers inside containers
-on it. A server takes no peer from another host, whatever its mechanism.
+on it. A peer on another host authenticates with ``munge`` or ``ssl``,
+in a PMIx configured ``--enable-remote-tools`` - see "A server on another
+host" in :doc:`../connections`.
 
 This page describes what ``native`` checks, in what order, and what a
 container needs for it to work.
@@ -111,7 +113,9 @@ Limits
 
 * A peer on another host, or in a container with a network of its own,
   connects from an address that is not this host's. The server refuses
-  it before ``native`` is asked - see :doc:`../connections`.
+  it before ``native`` is asked, unless it comes through the exchange
+  between hosts, which ``native`` cannot take part in - see
+  :doc:`../connections`.
 
 * On a platform whose kernel keeps no table of TCP connections - any
   but Linux, macOS and FreeBSD 12 or later, and a Linux host where

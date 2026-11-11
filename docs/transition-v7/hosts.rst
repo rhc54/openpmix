@@ -68,8 +68,13 @@ Starting the server
   attribute false overrides the site, and passing it true in a build
   without the support fails init, so a host that has no reason to
   decide should not pass it.
-* **Remote connections are gone.** ``PMIX_SERVER_REMOTE_CONNECTIONS``
-  set to true fails init.
+* **Remote connections are opt-in at build time.**
+  ``PMIX_SERVER_REMOTE_CONNECTIONS`` takes tools, launchers, schedulers
+  and servers of this release on other hosts only in a PMIx configured
+  ``--enable-remote-tools``; set true in any other, it fails init. The
+  two ends authenticate each other with ``munge`` or ``ssl``, and a
+  server with neither fails init too. Clients and processes of earlier
+  releases are never taken from another host.
 * **The local socket is owner-only.** To take tools of other users,
   pass ``PMIX_SERVER_ALLOW_FOREIGN_TOOLS`` *and* widen the socket
   (``PMIX_SOCKET_MODE``, with ``PMIX_USERID`` and ``PMIX_GRPID`` naming

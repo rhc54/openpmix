@@ -72,8 +72,9 @@ This process on %s will not connect to the PMIx server at
 
   %s:%d
 
-because that address is not this host's. A process connects only to a
-server on its own host.
+because that address is not this host's. A client connects only to the
+server on its own host, and a tool or server reaches one on another host
+only in a PMIx built with --enable-remote-tools.
 #
 [server-unnamed]
 This process on %s will not connect to the PMIx server at
@@ -213,9 +214,10 @@ rendezvous file:
 Please correct the error and try again.
 #
 [no-loopback-interfaces]
-This PMIx server takes TCP connections on a loopback interface only,
-but no loopback interfaces were found after applying any include or
-exclude directives:
+This PMIx server takes TCP connections on a loopback interface only, as
+it does not take tools on other hosts, but
+no loopback interfaces were found after applying any include or exclude
+directives:
 
   Include:    %s
   Exclude:    %s
@@ -224,10 +226,101 @@ exclude directives:
 Please adjust your include or exclude to allow selection of a
 loopback interface.
 #
-[remote-connections-not-supported]
-The host asked the PMIx server on %s to take connections from tools on
-other hosts (PMIX_SERVER_REMOTE_CONNECTIONS). A PMIx server takes
-connections from its own host only: do not ask for remote connections.
+[no-remote-interfaces]
+The PMIx server on %s takes connections from tools on other hosts, but
+no public interface was left after applying any include or exclude
+directives:
+
+  Include:    %s
+  Exclude:    %s
+  Available:  %s
+
+Adjust the include or exclude list to leave an interface other than
+loopback.
+#
+[remote-tools-not-built]
+The PMIx server on %s was asked, by %s, to take
+connections from tools on other hosts, but this PMIx was built without
+support for them.
+
+Rebuild PMIx configured --enable-remote-tools (with --with-munge or
+--with-openssl), or do not ask for them.
+#
+[remote-no-psec]
+The PMIx server on %s was asked to take connections from tools on other
+hosts. A tool on another host and its server prove who they are to each
+other with munge or ssl, and neither is available here as configured.
+The mechanisms this server has are:
+
+  %s
+
+munge needs a running munged, with a key shared by the hosts. ssl needs
+this server's certificate and key (psec_ssl_cert_file,
+psec_ssl_key_file) and the certificate authority its tools'
+certificates are issued by (psec_ssl_ca_file).
+#
+[remote-no-psec-tool]
+This process on %s is connecting to a PMIx server on another host:
+
+  %s
+
+A process and a server on different hosts prove who they are to each
+other with munge or ssl, and this process has neither as configured.
+Its security mechanisms are:
+
+  %s
+
+munge needs a running munged, with a key shared by the hosts. ssl needs
+this process's certificate and key (psec_ssl_cert_file,
+psec_ssl_key_file) and the certificate authority the server's
+certificate is issued by (psec_ssl_ca_file).
+#
+[remote-not-tool]
+This process on %s is connecting to a PMIx server on another host:
+
+  %s
+
+Only tools, launchers, schedulers and servers connect to a server on
+another host. A client - a process its server registered before it
+started - connects only to the server on its own host.
+#
+[remote-auth-refused]
+This process on %s asked the PMIx server it is connecting to on another
+host:
+
+  %s
+
+to prove who it is, and it did not:
+
+  %s
+
+A server takes processes from other hosts only when its host or its
+ptl_base_remote_tools parameter asks it to, only in a PMIx built with
+--enable-remote-tools, and only with munge or ssl configured. A server
+of a release before this one does not take them this way at all.
+#
+[remote-server-unproven]
+This process on %s did not connect to the PMIx server at
+
+  %s
+
+because the server's %s credential did not prove who it is:
+
+  %s
+
+For ssl, the server's certificate must be issued by a certificate
+authority in this process's psec_ssl_ca_file, allow server
+authentication, and name a user of this host. Both ends must have
+clocks within psec_ssl_max_skew seconds of each other. For munge, both
+hosts must share a munge key.
+#
+[server-identity-remote]
+The PMIx server this process on %s connected to is not one it may talk
+to: its credential proves it runs as
+
+  uid %lu, gid %lu
+
+and it should be %s.
 #
 [legacy-clients-not-built]
 The PMIx server on %s was asked, by %s, to take

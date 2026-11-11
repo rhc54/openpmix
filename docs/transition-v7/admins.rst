@@ -100,23 +100,24 @@ See :ref:`label-sysadmin-releases` and :ref:`clients of earlier releases <label-
 Tools on login nodes
 --------------------
 
-**What changed.** A tool - ``prun``, ``pterm``, a debugger, a monitor
-- reaches a PMIx server only on its own node. PMIx no longer takes
-connections from other nodes, and the ``ssl`` authentication that
-served them is gone. A server asked to take them
-(``PMIX_SERVER_REMOTE_CONNECTIONS``) fails to start.
+**What changed.** By default a tool - ``prun``, ``pterm``, a debugger,
+a monitor - reaches a PMIx server only on its own node. Connections from
+other nodes are built only into a PMIx configured
+``--enable-remote-tools``, and taken only when the site or the host asks
+(``ptl_base_remote_tools``, ``PMIX_SERVER_REMOTE_CONNECTIONS``). Asking
+in a build without them makes the server fail to start.
 
-**What to do.** Users run tools on the node where the server runs.
-For a launcher or a debugger, that means ssh to the node where the DVM
-controller (``prte`` or ``mpirun``) is running - the approach the DDT
-debugger recommends. Make sure users can reach that node.
-
-**Coming.** Launching from a login node will remain possible. The
-method is being worked out: most likely ``prun`` will send its launch
-request through PRRTE's own messaging rather than through PMIx.
-Debuggers are not settled yet.
-
-.. DRAFT: update when the login-node method is decided.
+**What to do.** Either run tools on the node where the server runs -
+for a launcher or a debugger, ssh to the node where the DVM controller
+(``prte`` or ``mpirun``) is running, the approach the DDT debugger
+recommends - or build PMIx ``--enable-remote-tools`` with
+``--with-munge`` or ``--with-openssl``, turn the support on, and give
+both ends what the mechanism needs: a MUNGE key shared by the nodes and
+a running ``munged``, or for ``ssl`` a certificate and key on each end
+and the certificate authority each other's is issued by
+(``psec_ssl_*``). Only tools, launchers, schedulers and servers of this
+release connect this way; clients never do. See
+:ref:`label-sysadmin-authentication`.
 
 
 Shared systems

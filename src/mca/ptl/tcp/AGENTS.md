@@ -23,20 +23,24 @@ and turns its URIs into addresses.
 | `ptl_tcp.h` | The component struct (with the primary listener's address) and `pmix_ptl_tcp_split_and_resolve`. |
 | `ptl_tcp_component.c` | Component struct + `component_query` (always available when built, priority 30). |
 | `ptl_tcp.c` | The module: `tcp_setup_listener`, `uri_to_addr`, and the interface helpers. |
-| `configure.m4` | Builds the component only when either direction of legacy support is (`$pmix_legacy_support`; `PMIX_ENABLE_LEGACY_SUPPORT`), and then makes it static - part of the library, never a plugin. |
+| `configure.m4` | Builds the component only when either direction of legacy support is, or remote tools are (`$pmix_tcp_transport`; `PMIX_ENABLE_TCP_TRANSPORT`), and then makes it static - part of the library, never a plugin. |
 
 ## What it does
 
 - **`setup_listener`** acts on the directives that are TCP's -
   `PMIX_TCP_IF_INCLUDE`/`EXCLUDE`, `PMIX_TCP_IPV4_PORT`/`IPV6_PORT`,
   `PMIX_TCP_DISABLE_IPV4`/`IPV6` - picks the interface (the first
-  loopback device the directives leave, or none: then it reports
-  `no-loopback-interfaces` and fails, and never takes a public one),
-  tries each port, binds, listens, and makes the URI
-  `<nspace>.<rank>;tcp4://host:port` (or `tcp6://[addr]:port`). The base
-  stores the URI, reports it, and writes the rendezvous files. The
-  transport serves peers of earlier releases on this host, and nothing
-  else.
+  loopback device the directives leave; or, when the server takes tools
+  on other hosts, the first public one; or none: then it reports
+  `no-loopback-interfaces` or `no-remote-interfaces` and fails, and
+  never takes one kind for the other), tries each port, binds, listens,
+  and makes the URI `<nspace>.<rank>;tcp4://host:port` (or
+  `tcp6://[addr]:port`). For tools on other hosts it then opens one more
+  listener on each other public interface (`open_alternates()`), trying
+  the primary's port first, and records where in
+  `pmix_ptl_base.alt_uris`. The base stores the URIs, reports them, and
+  writes the rendezvous files. The transport serves peers of earlier
+  releases on this host, and tools and servers on other hosts.
 - **`uri_to_addr`** turns `tcp4://` and `tcp6://` URIs into a
   `sockaddr_storage`, refusing a malformed address or a port that is not
   1-65535. Any other scheme gets `PMIX_ERR_NOT_SUPPORTED`, so the base asks

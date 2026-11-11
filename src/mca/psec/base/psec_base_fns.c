@@ -31,10 +31,11 @@
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_error.h"
 #include "src/util/pmix_output.h"
+#include "src/threads/pmix_mutex.h"
 
 #include "src/mca/psec/base/base.h"
 
-char *pmix_psec_base_get_available_modules(void)
+static char *list_modules(bool accepted_only)
 {
     pmix_psec_base_active_module_t *active;
     char **tmp = NULL, *reply = NULL;
@@ -44,6 +45,10 @@ char *pmix_psec_base_get_available_modules(void)
     }
 
     PMIX_LIST_FOREACH (active, &pmix_psec_globals.actives, pmix_psec_base_active_module_t) {
+        if (accepted_only && NULL != active->module->validates &&
+            !active->module->validates()) {
+            continue;
+        }
         /* this list is advertised to our clients as the mechanisms they
          * may select from, so a silently truncated one would hide a
          * mechanism that is actually available */
@@ -58,6 +63,76 @@ char *pmix_psec_base_get_available_modules(void)
         PMIx_Argv_free(tmp);
     }
     return reply;
+}
+
+char *pmix_psec_base_get_available_modules(void)
+{
+    return list_modules(false);
+}
+
+char *pmix_psec_base_get_accepted_modules(void)
+{
+    return list_modules(true);
+}
+
+bool pmix_psec_base_remote_capable(const pmix_psec_module_t *mod)
+{
+    return NULL != mod && NULL != mod->create_bound && NULL != mod->validate_bound &&
+           (NULL == mod->mutual || mod->mutual());
+}
+
+bool pmix_psec_base_remote_available(void)
+{
+    return NULL != pmix_psec_base_remote_module(NULL);
+}
+
+pmix_psec_module_t *pmix_psec_base_remote_module(pmix_psec_module_t *prefer)
+{
+    pmix_psec_base_active_module_t *active;
+
+    if (!pmix_psec_globals.initialized) {
+        return NULL;
+    }
+    PMIX_LIST_FOREACH (active, &pmix_psec_globals.actives, pmix_psec_base_active_module_t) {
+        if (active->module == prefer && pmix_psec_base_remote_capable(prefer)) {
+            return prefer;
+        }
+    }
+    PMIX_LIST_FOREACH (active, &pmix_psec_globals.actives, pmix_psec_base_active_module_t) {
+        if (pmix_psec_base_remote_capable(active->module)) {
+            return active->module;
+        }
+    }
+    return NULL;
+}
+
+pmix_psec_module_t *pmix_psec_base_remote_module_among(const char *list)
+{
+    pmix_psec_base_active_module_t *active;
+    pmix_psec_module_t *mod = NULL;
+    char **names;
+    int n;
+
+    if (!pmix_psec_globals.initialized || NULL == list) {
+        return NULL;
+    }
+    names = PMIx_Argv_split(list, ',');
+    PMIX_LIST_FOREACH (active, &pmix_psec_globals.actives, pmix_psec_base_active_module_t) {
+        if (!pmix_psec_base_remote_capable(active->module)) {
+            continue;
+        }
+        for (n = 0; NULL != names && NULL != names[n]; n++) {
+            if (0 == strcmp(names[n], active->module->name)) {
+                mod = active->module;
+                break;
+            }
+        }
+        if (NULL != mod) {
+            break;
+        }
+    }
+    PMIx_Argv_free(names);
+    return mod;
 }
 
 pmix_psec_module_t *pmix_psec_base_assign_module(const char *options)
@@ -195,11 +270,16 @@ typedef struct {
 
 static gid_cache_entry_t gid_cache[PMIX_PSEC_BASE_GID_CACHE_SIZE];
 static uint64_t gid_cache_tick = 0;
+/* ssl's validate_cred reaches the cache from PMIx_Validate_credential, on
+ * whichever thread called it, as well as from the connection handler */
+static pmix_mutex_t gid_cache_lock = PMIX_MUTEX_STATIC_INIT;
 
 void pmix_psec_base_gid_cache_flush(void)
 {
+    pmix_mutex_lock(&gid_cache_lock);
     memset(gid_cache, 0, sizeof(gid_cache));
     gid_cache_tick = 0;
+    pmix_mutex_unlock(&gid_cache_lock);
 }
 
 static bool gid_cache_live(const gid_cache_entry_t *e, time_t now)
@@ -288,23 +368,19 @@ done:
     return held;
 }
 
-bool pmix_psec_base_gid_held(uid_t uid, gid_t gid)
+/* The slot for (uid, gid): its live entry, else an empty or expired one,
+ * else the least recently used. Call with gid_cache_lock held */
+static gid_cache_entry_t *gid_cache_find(uid_t uid, gid_t gid, time_t now, bool *hit)
 {
     gid_cache_entry_t *e, *slot = NULL;
-    time_t now;
-    bool held, answered;
     size_t n;
 
-    if (0 == uid) {
-        return true;
-    }
-
-    now = pmix_psec_base_gid_ops.now();
+    *hit = false;
     for (n = 0; n < PMIX_PSEC_BASE_GID_CACHE_SIZE; n++) {
         e = &gid_cache[n];
         if (gid_cache_live(e, now) && uid == e->uid && gid == e->gid) {
-            e->used = ++gid_cache_tick;
-            return e->held;
+            *hit = true;
+            return e;
         }
         /* the place for a new answer: an empty or expired entry, or
          * else the least recently used one */
@@ -313,15 +389,45 @@ bool pmix_psec_base_gid_held(uid_t uid, gid_t gid)
             slot = e;
         }
     }
+    return slot;
+}
 
+bool pmix_psec_base_gid_held(uid_t uid, gid_t gid)
+{
+    gid_cache_entry_t *slot;
+    time_t now;
+    bool held, answered, hit;
+
+    if (0 == uid) {
+        return true;
+    }
+
+    pmix_mutex_lock(&gid_cache_lock);
+    slot = gid_cache_find(uid, gid, pmix_psec_base_gid_ops.now(), &hit);
+    if (hit) {
+        slot->used = ++gid_cache_tick;
+        held = slot->held;
+        pmix_mutex_unlock(&gid_cache_lock);
+        return held;
+    }
+    pmix_mutex_unlock(&gid_cache_lock);
+
+    /* the lookup can block on a directory service, so it is made
+     * without the lock: a caller on the progress thread does not wait
+     * on another thread's lookup */
     held = gid_lookup(uid, gid, &answered);
     if (answered) {
-        /* the lookup may have taken a while */
+        /* the lookup may have taken a while, and another thread may
+         * have cached this pair meanwhile - find its slot again */
+        pmix_mutex_lock(&gid_cache_lock);
+        now = pmix_psec_base_gid_ops.now();
+        slot = gid_cache_find(uid, gid, now, &hit);
         slot->uid = uid;
         slot->gid = gid;
         slot->held = held;
-        slot->stamp = pmix_psec_base_gid_ops.now();
+        slot->stamp = now;
         slot->used = ++gid_cache_tick;
+        pmix_mutex_unlock(&gid_cache_lock);
     }
     return held;
 }

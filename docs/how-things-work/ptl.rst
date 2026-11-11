@@ -124,9 +124,14 @@ socket - the first two steps below are the ``tcp`` transport's, in
    a subnet, or an include list none of whose entries is on this host,
    stops the listener from opening at all. A loopback device's address
    must be a loopback address. Directives that leave no loopback device
-   fail the server's init: a public interface is never taken instead. A
-   host that asks for connections from other hosts
-   (``PMIX_SERVER_REMOTE_CONNECTIONS`` set to true) fails its init too.
+   fail the server's init: a public interface is never taken instead -
+   unless the server takes tools on other hosts
+   (``ptl_base_remote_tools``, or ``PMIX_SERVER_REMOTE_CONNECTIONS`` set
+   to true, in a PMIx configured ``--enable-remote-tools``; in one
+   without it, asking fails the init). Then it takes the first public
+   interface the directives leave instead, and opens a listener on each
+   other public interface too, whose addresses are its *alternates*;
+   directives that leave none fail the init.
 #. **Bind a listen socket.** Try each configured port (default ``0`` —
    let the kernel assign one), set ``SO_REUSEADDR`` and close-on-exec,
    ``listen`` with ``SOMAXCONN``, and make the socket non-blocking.
@@ -134,7 +139,9 @@ socket - the first two steps below are the ``tcp`` transport's, in
    ``nspace.rank;tcp4://host:port``. The base stores the server's URI -
    this one when there is a TCP listener, else the local socket's - in
    ``gds`` under ``PMIX_SERVER_URI`` (for older tools), and the local
-   socket's under ``PMIX_MYSERVER_URI``. If
+   socket's under ``PMIX_MYSERVER_URI``; the alternates,
+   comma-separated, under ``PMIX_MYSERVER_ALT_URIS``, and on an
+   ``alturis:`` line of the rendezvous and report files. If
    ``report_uri`` is set, also emit it: the local socket's URI to stdout
    (``-``) or stderr (``+``); the TCP URI to stdout (``tcp-``) or stderr
    (``tcp+``), which fail the init with no TCP listener; to an integer
@@ -421,7 +428,11 @@ environment, as a client does. A rendezvous or report file with a
 only there. A file without one is an older server's, and the tool uses
 its TCP URI. One whose ``local:`` line names another host - a report
 file read elsewhere - is for a tool on that host; a tool here is left
-with the TCP URI, which is not its host's, and does not dial it.
+with the TCP URI, which is not its host's, and with the ``alturis:``
+line's addresses. It dials them only in a PMIx configured
+``--enable-remote-tools``, where the server proves who it is (see "A
+server on another host" in :doc:`connections`); otherwise it does not
+dial them.
 
 A client's or tool's connection to its server is close-on-exec whichever
 transport it is on: a process that execs leaves its connection behind,
@@ -447,8 +458,11 @@ user - no group - of a server on the same host, and the same rule is
 applied by user alone. A server the table does not show is refused. A
 server at an address that is not this host's - by the interface list,
 or by the kernel's own list of the addresses its interfaces hold - is
-never dialled (``PMIX_ERR_UNREACH``): a process connects only to a
-server on its own host. Where the platform has no table to ask, a
+dialled only by a tool, launcher, scheduler or server in a PMIx
+configured ``--enable-remote-tools``, and is then not checked by the
+kernel but proves who it is (see "A server on another host" in
+:doc:`connections`); otherwise it is never dialled
+(``PMIX_ERR_UNREACH``). Where the platform has no table to ask, a
 process connects only to a server named for it - a client's, or the one
 that started it - or one whose file vouches for it - see "A server the
 kernel cannot name" in :doc:`connections`.

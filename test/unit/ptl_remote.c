@@ -6,12 +6,15 @@
  *
  * $HEADER$
  *
- * Connections between hosts, which neither end takes.
+ * Connections between hosts, which neither end takes unless asked.
  *
- * A host that asks with PMIX_SERVER_REMOTE_CONNECTIONS fails its init,
- * and one that says no initializes. The TCP listener is on a loopback
- * interface or nowhere: a server whose directives leave it no loopback
- * interface fails its init rather than taking a public one.
+ * A host that asks with PMIX_SERVER_REMOTE_CONNECTIONS fails its init in
+ * a build without remote tools, saying so, and in one with them when it
+ * has no mechanism that authenticates across hosts (only native here);
+ * one that says no initializes. Without remote tools the TCP listener is
+ * on a loopback interface or nowhere: a server whose directives leave it
+ * no loopback interface fails its init rather than taking a public one.
+ * The exchange itself is test/unit/ptl_remote_auth.c.
  *
  * Which peers are on this host: a loopback address, and the address of
  * one of this host's interfaces, either way an IPv4 address arrives. Any
@@ -195,8 +198,8 @@ static void release(int saved)
     }
 }
 
-/* A process dials only a server on this host: one at an address that is
- * not is PMIX_ERR_UNREACH before any connect, saying so */
+/* Whether a server is on this host: one at an address that is not is
+ * PMIX_ERR_UNREACH, saying so - and how a connect goes to each */
 static int case_server_on_host(void)
 {
     struct sockaddr_storage ss;
@@ -231,6 +234,52 @@ static int case_server_on_host(void)
     load6(&ss, "2001:db8::1");
     rc |= check("nor one at 2001:db8::1",
                 PMIX_ERR_UNREACH == pmix_ptl_base_server_on_host(&ss, NULL));
+    /* and how a connect goes to it. This process is a server, which in a
+     * build with remote tools reaches one on another host by the
+     * exchange between hosts - see ptl_remote_auth.c */
+    {
+        bool remote = true;
+
+        if (!capture(path, sizeof(path), &saved)) {
+            PMIx_server_finalize();
+            return CHILD_FAIL;
+        }
+        load4(&ss, "192.0.2.1");
+        prc = pmix_ptl_base_server_route(&ss, NULL, "tcp4://192.0.2.1:1", &remote);
+#if PMIX_ENABLE_REMOTE_TOOLS
+        release(saved);
+        unlink(path);
+        rc |= check("a connect takes it as on another host",
+                    PMIX_SUCCESS == prc && remote);
+#else
+        /* its notice is the one server_on_host gave above, which the
+         * aggregation counts rather than shows again */
+        release(saved);
+        unlink(path);
+        rc |= check("a connect does not dial it: PMIX_ERR_UNREACH",
+                    PMIX_ERR_UNREACH == prc && !remote);
+#endif
+        load4(&ss, "127.0.0.1");
+        remote = true;
+        if (!capture(path, sizeof(path), &saved)) {
+            PMIx_server_finalize();
+            return CHILD_FAIL;
+        }
+        prc = pmix_ptl_base_server_route(&ss, NULL, "tcp4://127.0.0.1:1", &remote);
+#if PMIX_ENABLE_LEGACY_SERVERS
+        release(saved);
+        unlink(path);
+        rc |= check("a connect takes 127.0.0.1 as this host", PMIX_SUCCESS == prc && !remote);
+#else
+        for (n = 0; n < 500 && !(spoke = said(path, "Only a server of a PMIx release")); n++) {
+            usleep(10000);
+        }
+        release(saved);
+        unlink(path);
+        rc |= check("a connect refuses TCP on this host without legacy servers, saying why",
+                    PMIX_ERR_NOT_SUPPORTED == prc && !remote && spoke);
+#endif
+    }
     PMIx_server_finalize();
     return rc;
 }
@@ -242,9 +291,15 @@ static int case_remote_directive(bool want)
     pmix_info_t info;
     pmix_status_t prc;
     char path[1024];
-    const char *reason = "do not ask for remote connections";
+#if PMIX_ENABLE_REMOTE_TOOLS
+    /* with nothing that can authenticate across hosts */
+    const char *reason = "neither is available here as configured";
+#else
+    const char *reason = "configured --enable-remote-tools";
+#endif
     int saved;
 
+    setenv("PMIX_MCA_psec", "native", 1);
     if (!capture(path, sizeof(path), &saved)) {
         return CHILD_FAIL;
     }

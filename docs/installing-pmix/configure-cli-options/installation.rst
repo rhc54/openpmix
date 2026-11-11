@@ -281,9 +281,11 @@ be used with ``configure``:
             ``configure`` stops with an error if it is excluded: a
             process of this release reaches a server on its host over
             ``usock``. The ``tcp`` component carries every connection
-            with a peer of an earlier release, so it is built - and
-            cannot be excluded - whenever either of the two options
-            below is enabled, and is left out when neither is.
+            with a peer of an earlier release or a tool on another
+            host, so it is built - and cannot be excluded - whenever
+            either of the two legacy options below, or
+            ``--enable-remote-tools``, is enabled, and is left out when
+            none is.
 
 PMIx releases before v7.0 reach a server over TCP, and speak wire
 formats of their own. Support for them comes in two directions, each
@@ -329,6 +331,28 @@ with its own option:
   every server, launcher and scheduler fail to start.
   ``ptl_base_legacy_peers`` turns on only the directions the build has,
   so it is safe in any build. See :ref:`label-settings-matrix-legacy`.
+
+* ``--enable-remote-tools``: Build support for tools, launchers,
+  schedulers and servers of this release on other hosts connecting to a
+  PMIx server over TCP - ``prun`` or a debugger on a login node reaching
+  a DVM on the compute nodes, say, or a server reaching a scheduler.
+  Without it - the default - a server takes connections from its own
+  host only, and a tool or server does not dial a server at an address
+  that is not its host's. With it, a server takes them only when the
+  ``ptl_base_remote_tools`` MCA parameter, or its host's
+  ``PMIX_SERVER_REMOTE_CONNECTIONS`` attribute, says so; the parameter
+  defaults to ``false``. A client never connects this way: its server
+  is the one on its own host.
+
+  It requires ``--with-munge`` or ``--with-openssl`` as well:
+  ``configure`` stops with an error otherwise. A tool on another host
+  and its server prove who they are to each other with ``munge`` or
+  ``ssl``, the server first; ``native`` asks the kernel of its own host,
+  which knows nothing of a process on another. A build without remote
+  tools refuses the run-time settings that ask for them: setting
+  ``ptl_base_remote_tools`` true, or a host passing
+  ``PMIX_SERVER_REMOTE_CONNECTIONS`` true, makes the server fail to
+  start. See :ref:`label-conn-between-hosts`.
 
 * ``--disable-show-load-errors-by-default``:
   Set the default value of the ``mca_base_component_show_load_errors``

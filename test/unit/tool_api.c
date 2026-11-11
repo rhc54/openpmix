@@ -414,7 +414,7 @@ int main(int argc, char **argv)
     check_optional_int("optional init takes a PMIX_TIMEOUT of one second", PMIX_TIMEOUT, 1, 1);
     check_optional("optional init refuses a URI that does not parse",
                    PMIX_SERVER_URI, "not-a-uri", 0);
-#if PMIX_ENABLE_LEGACY_SUPPORT
+#if PMIX_ENABLE_TCP_TRANSPORT
     check_optional("optional init refuses a URI whose address does not parse",
                    PMIX_SERVER_URI, "probe.0;tcp4://not.an.address:1", 0);
 #endif

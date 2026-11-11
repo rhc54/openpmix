@@ -179,15 +179,20 @@ static int pending_cap(void)
 void pmix_ptl_base_start_listening(void)
 {
     pmix_listener_t *lt = &pmix_ptl_base.listener;
+    pmix_listener_t *alt;
 
     pmix_ptl_base.pending_cap = pending_cap();
     arm_listener(lt);
     arm_listener(&pmix_ptl_base.local_listener);
+    PMIX_LIST_FOREACH (alt, &pmix_ptl_base.alt_listeners, pmix_listener_t) {
+        arm_listener(alt);
+    }
 }
 
 void pmix_ptl_base_stop_listening(void)
 {
     pmix_listener_t *lt = &pmix_ptl_base.listener;
+    pmix_listener_t *alt;
     pmix_pending_connection_t *pnd, *pnext;
     uint32_t u32;
 
@@ -219,6 +224,15 @@ void pmix_ptl_base_stop_listening(void)
      * gone with it. Clear it here rather than at the top of setup so a
      * repeated start_listening within one cycle still short-circuits. */
     setup_complete = false;
+
+    /* the alternates go whether or not they were ever armed: their sockets
+     * were bound and listening from the moment setup created them */
+    while (NULL != (alt = (pmix_listener_t *) pmix_list_remove_first(&pmix_ptl_base.alt_listeners))) {
+        disarm_listener(alt);
+        PMIX_RELEASE(alt);  // the destructor closes its socket
+    }
+    free(pmix_ptl_base.alt_uris);
+    pmix_ptl_base.alt_uris = NULL;
 
     /* the local listener's socket too, whether or not it was ever armed */
     disarm_listener(&pmix_ptl_base.local_listener);
@@ -705,7 +719,11 @@ static char *compat_lines(void)
         return NULL;
     }
     bfrops = pmix_bfrops_base_get_available_modules();
-    psec = pmix_psec_base_get_available_modules();
+    /* the mechanisms we can check a peer's credential with */
+    psec = pmix_psec_base_get_accepted_modules();
+    if (NULL == psec) {
+        psec = pmix_psec_base_get_available_modules();
+    }
     if (0 > pmix_asprintf(&lines, "%s%s%s%s%s%s",
                           (NULL == bfrops) ? "" : PMIX_PTL_BFROPS_TAG,
                           (NULL == bfrops) ? "" : bfrops,
@@ -1055,13 +1073,17 @@ static pmix_status_t write_rndz_file(char *filename, char *uri, const char *role
         snprintf(tbuf, sizeof(tbuf), "\n");
     }
     /* The five lines every release reads by position come first and are
-     * unchanged; our local transport's address, wire formats and security
-     * mechanisms follow them, tagged, where no older reader looks. */
+     * unchanged; our local transport's address, our other TCP addresses,
+     * wire formats and security mechanisms follow them, tagged, where no
+     * older reader looks. The other addresses cannot go in the URI
+     * itself: every released parser refuses a URI carrying more than one
+     * address, and a client refused that way quietly runs as a
+     * singleton. */
     compat = compat_lines();
     locked = (0 <= lockfd);
     /* with no TCP listener the first line is the local socket already */
-    local = pmix_ptl_base.legacy_clients ? pmix_ptl_base.local_listener.uri : NULL;
-    if (0 > pmix_asprintf(&tmp, "%s\n%s\n%lu\n%lu:%lu\n%s\n%s%s%s%s%s%s%s%s%s",
+    local = (NULL != pmix_ptl_base.listener.uri) ? pmix_ptl_base.local_listener.uri : NULL;
+    if (0 > pmix_asprintf(&tmp, "%s\n%s\n%lu\n%lu:%lu\n%s\n%s%s%s%s%s%s%s%s%s%s%s%s",
                           uri, PMIX_VERSION, (unsigned long)pmix_globals.pid,
                           (unsigned long)pmix_globals.uid,
                           (unsigned long)pmix_globals.gid,
@@ -1071,6 +1093,9 @@ static pmix_status_t write_rndz_file(char *filename, char *uri, const char *role
                           (NULL == local) ? "" : ";",
                           (NULL == local) ? "" : local,
                           (NULL == local) ? "" : "\n",
+                          (NULL == pmix_ptl_base.alt_uris) ? "" : PMIX_PTL_ALT_URIS_TAG,
+                          (NULL == pmix_ptl_base.alt_uris) ? "" : pmix_ptl_base.alt_uris,
+                          (NULL == pmix_ptl_base.alt_uris) ? "" : "\n",
                           (NULL == compat) ? "" : compat,
                           locked ? PMIX_PTL_LOCK_TAG : "", locked ? PMIX_PTL_LOCK_FLOCK : "",
                           locked ? "\n" : "")) {
@@ -1391,6 +1416,7 @@ pmix_status_t pmix_ptl_base_setup_listener(pmix_info_t info[], size_t ninfo)
     char *leftover, *uri, *rdir = NULL;
     size_t n;
     const char *legacy_from = "ptl_base_legacy_clients";
+    const char *remote_from = "ptl_base_remote_tools";
     pmix_info_t *sessinfo = NULL;
     uint32_t idval;
     bool tool_support_given = false;
@@ -1404,6 +1430,9 @@ pmix_status_t pmix_ptl_base_setup_listener(pmix_info_t info[], size_t ninfo)
      * them by name - and in such a build fails the init below */
     pmix_ptl_base.legacy_clients = pmix_ptl_base.legacy_clients_param ||
                                    (PMIX_ENABLE_LEGACY_CLIENTS && pmix_ptl_base.legacy_peers_param);
+    /* ptl_base_remote_tools, or the host's attribute, asks for tools on
+     * other hosts - and in a build without them fails the init below */
+    pmix_ptl_base.remote_tools = pmix_ptl_base.remote_tools_param;
     for (n = 0; n < ninfo; n++) {
         if (0 == strcmp(info[n].key, PMIX_SERVER_SESSION_SUPPORT)) {
             pmix_ptl_base.session_tool = PMIX_INFO_TRUE(&info[n]);
@@ -1442,12 +1471,8 @@ pmix_status_t pmix_ptl_base_setup_listener(pmix_info_t info[], size_t ninfo)
             tool_support_given = true;
 
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_SERVER_REMOTE_CONNECTIONS)) {
-            /* a server takes connections from its own host only */
-            if (PMIX_INFO_TRUE(&info[n])) {
-                pmix_show_help("help-ptl-base.txt", "remote-connections-not-supported", true,
-                               pmix_globals.hostname);
-                return PMIX_ERR_SILENT;
-            }
+            pmix_ptl_base.remote_tools = PMIX_INFO_TRUE(&info[n]);
+            remote_from = PMIX_SERVER_REMOTE_CONNECTIONS;
 
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_SERVER_LEGACY_PEERS)) {
             pmix_ptl_base.legacy_clients = PMIX_INFO_TRUE(&info[n]);
@@ -1504,6 +1529,26 @@ pmix_status_t pmix_ptl_base_setup_listener(pmix_info_t info[], size_t ninfo)
     PMIX_HIDE_UNUSED_PARAMS(legacy_from);
 #endif
 
+    if (pmix_ptl_base.remote_tools) {
+#if !PMIX_ENABLE_REMOTE_TOOLS
+        pmix_show_help("help-ptl-base.txt", "remote-tools-not-built", true,
+                       pmix_globals.hostname, remote_from);
+        return PMIX_ERR_SILENT;
+#else
+        /* a tool on another host and its server prove who they are to
+         * each other with a credential made for the one connection,
+         * which only some mechanisms make */
+        if (!pmix_psec_base_remote_available()) {
+            leftover = pmix_psec_base_get_available_modules();
+            pmix_show_help("help-ptl-base.txt", "remote-no-psec", true, pmix_globals.hostname,
+                           (NULL == leftover) ? "none" : leftover);
+            free(leftover);
+            return PMIX_ERR_SILENT;
+        }
+#endif
+    }
+    PMIX_HIDE_UNUSED_PARAMS(remote_from);
+
     /* A session-level server's file is named by the ID its host gives it,
      * PMIX_SESSION_RNDZ_ID, else by the session's PMIX_SESSION_ID: servers
      * of different sessions share a node, and a tool asks for the one it
@@ -1539,9 +1584,10 @@ pmix_status_t pmix_ptl_base_setup_listener(pmix_info_t info[], size_t ninfo)
     lt->cbfunc = pmix_ptl_base_connection_handler;
 
     /* The TCP transport opens its socket and says where it is - only for
-     * those who use it: peers of earlier releases. A process of this
-     * release uses the local one */
-    if (pmix_ptl_base.legacy_clients) {
+     * those who use it: peers of earlier releases, and tools and servers
+     * on other hosts. A process of this release on this host uses the
+     * local one */
+    if (pmix_ptl_base.legacy_clients || pmix_ptl_base.remote_tools) {
         rc = pmix_ptl_base_listen(info, ninfo, lt);
         if (PMIX_SUCCESS != rc) {
             goto sockerror;
@@ -1572,6 +1618,10 @@ pmix_status_t pmix_ptl_base_setup_listener(pmix_info_t info[], size_t ninfo)
     rc = store_uri(PMIX_MYSERVER_URI, llt->uri);
     if (PMIX_SUCCESS == rc) {
         rc = store_uri(PMIX_SERVER_URI, uri);
+    }
+    /* and where else a tool on another host may reach us */
+    if (PMIX_SUCCESS == rc && NULL != pmix_ptl_base.alt_uris) {
+        rc = store_uri(PMIX_MYSERVER_ALT_URIS, pmix_ptl_base.alt_uris);
     }
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
@@ -1710,9 +1760,15 @@ pmix_status_t pmix_ptl_base_setup_listener(pmix_info_t info[], size_t ninfo)
                 /* and, after everything an older reader looks at, the
                  * local socket, for a tool on this host - a report file
                  * may be read on another */
-                if (pmix_ptl_base.legacy_clients && NULL != pmix_ptl_base.local_listener.uri) {
+                if (NULL != pmix_ptl_base.listener.uri &&
+                    NULL != pmix_ptl_base.local_listener.uri) {
                     fprintf(fp, "%s%s;%s\n", PMIX_PTL_LOCAL_URI_TAG, pmix_globals.hostname,
                             pmix_ptl_base.local_listener.uri);
+                }
+                /* the other addresses a tool on another host may reach
+                 * us at */
+                if (NULL != pmix_ptl_base.alt_uris) {
+                    fprintf(fp, "%s%s\n", PMIX_PTL_ALT_URIS_TAG, pmix_ptl_base.alt_uris);
                 }
                 /* and the wire formats and security mechanisms we accept */
                 leftover = compat_lines();

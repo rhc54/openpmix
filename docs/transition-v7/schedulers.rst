@@ -34,17 +34,22 @@ The second is where v7 changes the most: what a request tells the
 scheduler about who made it. See `Who is asking`_.
 
 
-Runtimes connect only on the scheduler's node
----------------------------------------------
+Runtimes connect on the scheduler's node, unless built otherwise
+----------------------------------------------------------------
 
-**What changed.** PMIx messaging is node-local. A tool - and an
-attaching runtime is a tool to the scheduler - connects only to a PMIx
-server on its own node. Connections from other nodes are gone, and a
-server that asks for them (``PMIX_SERVER_REMOTE_CONNECTIONS``) fails
-to start.
+**What changed.** By default PMIx messaging is node-local. A tool -
+and an attaching runtime is a tool to the scheduler, as a server
+reaching it is - connects only to a PMIx server on its own node.
+Connections from other nodes are built only into a PMIx configured
+``--enable-remote-tools``, and taken only when the scheduler's host
+passes ``PMIX_SERVER_REMOTE_CONNECTIONS`` true (or the site sets
+``ptl_base_remote_tools``); asking in a build without them makes the
+server fail to start. With them, a runtime on another node can attach
+to the scheduler directly, the two authenticating each other with
+``munge`` or ``ssl`` - see :ref:`label-conn-between-hosts`.
 
-**What it means.** A runtime attaches to a scheduler server on the node
-it runs on. It looks for ``pmix.sched.<hostname>``, named for its own
+**What it means.** Without remote tools, a runtime attaches to a
+scheduler server on the node it runs on. It looks for ``pmix.sched.<hostname>``, named for its own
 node. A scheduler that serves runtimes on other nodes runs a PMIx
 server on each of those nodes - an agent - and carries requests between
 its agents and its core over its own transport, as resource managers

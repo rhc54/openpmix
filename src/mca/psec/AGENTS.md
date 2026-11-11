@@ -146,6 +146,10 @@ unused pointers stay `NULL`, and the framework macros guard on them.
 | `finalize` | `(void) -> void` | both | module tear-down, invoked by `pmix_psec_close` for each active module at framework close (e.g. `munge_finalize` frees the cached credential) |
 | `create_cred` | `(peer, directives, ndirs, &info, &ninfo, cred)` | client | build a credential blob for this process |
 | `validate_cred` | `(peer, directives, ndirs, &info, &ninfo, cred)` | server | check a received credential; required - a module without it is never selected |
+| `validates` | `(void) -> bool` | server | whether, as configured, it can check a peer's credential - `ssl` given no CA cannot. NULL means always. A server chooses, and lists in its files (`pmix_psec_base_get_accepted_modules()`), only one that can |
+| `create_bound` | `(bind, server, to, cred)` | both | between hosts: a credential for one connection, carrying `bind`, as a server's or a tool's, for the user `to` where the mechanism can restrict who decodes it. NULL for a module that cannot authenticate a process on another host |
+| `validate_bound` | `(bind, server, cred, &uid, &gid)` | both | check one: exactly `bind`, made in the role given; the identity it proves |
+| `mutual` | `(void) -> bool` | both | whether, as configured, it can both make and check a bound credential - each end between hosts does both. NULL means always |
 
 The `directives`/`info` pairs carry the attribute arrays required of
 every PMIx interface: `directives` are caller inputs (e.g.
@@ -290,8 +294,9 @@ The psec interface went to 2.0.0 when `validate_cred` was given the
 peer, so a module can see the identity the peer was registered or
 connected as, to 4.0.0 when the handshake slots were removed, to 5.0.0
 when `remote` gave way to `create_bound`/`validate_bound`/`mutual` for
-tools on other hosts, and to 6.0.0 when those, and `validates`, were
-removed with them: a server takes peers on its own host only.
+tools on other hosts, to 6.0.0 when those, and `validates`, were
+removed with them, and to 7.0.0 when they came back with
+`--enable-remote-tools` and the `ssl` component.
 
 ## The `PMIX_PSEC_*` macros ([`psec.h`](psec.h))
 
@@ -333,6 +338,7 @@ Default priorities come from each component's `component_query`:
 |-----------|----------|-------|-------------|
 | `munge` | 80 | single-shot | built only if `--with-munge` was given and libmunge is found; `init` succeeds only if the `munged` daemon issues a credential |
 | `native` | 10 | single-shot | always (no `configure.m4`, no gate); authenticates **peers on this host's kernel**, containers included |
+| `ssl` | 5 | single-shot, and bound between hosts | built only with `--with-openssl`; active when given a CA or an identity - see [`ssl/AGENTS.md`](ssl/AGENTS.md) |
 
 Because the list is priority-ordered and `assign_module(NULL)` returns
 the highest-priority module, a peer that does not name a mechanism gets
@@ -404,7 +410,8 @@ src/mca/psec/
 │   ├── psec_base_select.c    query components, build priority-ordered actives list
 │   └── psec_base_fns.c       get_available_modules + assign_module (name lookup)
 ├── native/                   uid/gid from the kernel: the local socket's peer, or the TCP socket's owner (default, always available)
-└── munge/                    MUNGE credentials (conditional on libmunge)
+├── munge/                    MUNGE credentials (conditional on libmunge)
+└── ssl/                      X.509 certificates, for peers on other hosts (conditional on OpenSSL)
 ```
 
 ## Building

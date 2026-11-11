@@ -603,9 +603,12 @@ pmix_status_t pmix_ptl_base_check_found(pmix_list_t *connections)
 }
 
 /* The address to connect to from a server's file: its local transport's
- * when the file names one, else the first line's */
+ * when the file names one for this host, else the first line's - with
+ * the server's other addresses, for a tool on another host */
 static void take_address(pmix_connection_t *cn, char **suri)
 {
+    free(pmix_ptl_base.connect_alt_uris);
+    pmix_ptl_base.connect_alt_uris = NULL;
     if (NULL != cn->local_uri) {
         *suri = cn->local_uri;
         cn->local_uri = NULL;
@@ -613,6 +616,8 @@ static void take_address(pmix_connection_t *cn, char **suri)
     }
     *suri = cn->uri;
     cn->uri = NULL;
+    pmix_ptl_base.connect_alt_uris = cn->alt_uris;
+    cn->alt_uris = NULL;
 }
 
 static pmix_status_t tryfile(pmix_peer_t *peer, char **nspace,
@@ -999,6 +1004,22 @@ pmix_status_t pmix_ptl_base_check_connect_directives(const pmix_info_t info[], s
                 return PMIX_ERR_BAD_PARAM;
             }
 
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_SERVER_ALT_URIS)) {
+            /* each entry is an address as a URI carries it after its ';' -
+             * one a transport here can read */
+            if (!is_string_value(&info[n])) {
+                return PMIX_ERR_BAD_PARAM;
+            }
+            order = PMIx_Argv_split(info[n].value.data.string, ',');
+            for (m = 0; NULL != order && NULL != order[m]; m++) {
+                rc = pmix_ptl_base_setup_connection(order[m], &addr, &len);
+                if (PMIX_SUCCESS != rc) {
+                    PMIx_Argv_free(order);
+                    return (PMIX_ERR_NOMEM == rc) ? rc : PMIX_ERR_BAD_PARAM;
+                }
+            }
+            PMIx_Argv_free(order);
+
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_TCP_URI) ||
                    PMIX_CHECK_KEY(&info[n], PMIX_SERVER_URI)) {
             if (!is_string_value(&info[n])) {
@@ -1013,7 +1034,7 @@ pmix_status_t pmix_ptl_base_check_connect_directives(const pmix_info_t info[], s
                 /* parse_uri's own copies failed */
                 return (PMIX_ERR_NOMEM == rc) ? rc : PMIX_ERR_BAD_PARAM;
             }
-#if !PMIX_ENABLE_LEGACY_SUPPORT
+#if !PMIX_ENABLE_TCP_TRANSPORT
             /* no transport here reads a TCP address, so none can say it is
              * malformed: the connect refuses a TCP URI given alone, as
              * every build does, and honors "optional" for it */
@@ -1052,6 +1073,7 @@ static pmix_status_t do_connect(struct pmix_peer_t *pr,
                                 pmix_ptl_connect_nb_cbfunc_t cbfunc, void *cbdata)
 {
     char *suri = NULL, *evar, *localuri = NULL;
+    const char *diralts = NULL;     // the server's other addresses, as PMIX_SERVER_ALT_URIS gives them
     char *filename, *nspace = NULL;
     char **order = NULL;
     const char* tmp;
@@ -1093,6 +1115,8 @@ static pmix_status_t do_connect(struct pmix_peer_t *pr,
     pmix_ptl_base.source_file = NULL;
     free(pmix_ptl_base.source_uri);
     pmix_ptl_base.source_uri = NULL;
+    free(pmix_ptl_base.connect_alt_uris);
+    pmix_ptl_base.connect_alt_uris = NULL;
     pmix_ptl_base.rndz_owner_given = false;
     pmix_ptl_base.rndz_pid = 0;
 
@@ -1221,6 +1245,11 @@ static pmix_status_t do_connect(struct pmix_peer_t *pr,
 
             } else if (PMIX_CHECK_KEY(&info[n], PMIX_TOOL_CONNECT_OPTIONAL)) {
                 optional = PMIX_INFO_TRUE(&info[n]);
+
+            } else if (PMIX_CHECK_KEY(&info[n], PMIX_SERVER_ALT_URIS)) {
+                /* vetted by pmix_ptl_base_check_connect_directives; only
+                 * meaningful with the URI it accompanies */
+                diralts = info[n].value.data.string;
 
             } else if (PMIX_CHECK_KEY(&info[n], PMIX_TCP_URI)
                        || PMIX_CHECK_KEY(&info[n], PMIX_SERVER_URI)) {
@@ -1412,14 +1441,23 @@ static pmix_status_t do_connect(struct pmix_peer_t *pr,
             rc = PMIX_ERR_BAD_PARAM;
             goto cleanup;
         }
-        /* A TCP address alone names no server we can connect to: one of
-         * this release takes us on its local socket, and one of an
-         * earlier release needs the version its file gives. Refused
-         * before any connection is made */
-        if (pmix_ptl_base_is_tcp_uri(suri)) {
+        /* A TCP address alone names no server on this host we can
+         * connect to: one of this release takes us on its local socket,
+         * and one of an earlier release needs the version its file gives.
+         * Refused before any connection is made - unless it is another
+         * host's, where a server of this release takes a tool or server
+         * over TCP, and proves who it is */
+        if (pmix_ptl_base_is_tcp_uri(suri) && !pmix_ptl_base_uri_is_remote(suri)) {
             pmix_show_help("help-ptl-base.txt", "tcp-uri-alone", true, pmix_ptl_base.uri);
             rc = PMIX_ERR_NOT_SUPPORTED;
             goto cleanup;
+        }
+        if (NULL != diralts) {
+            pmix_ptl_base.connect_alt_uris = strdup(diralts);
+            if (NULL == pmix_ptl_base.connect_alt_uris) {
+                rc = PMIX_ERR_NOMEM;
+                goto cleanup;
+            }
         }
         /* a URI passed directly - by the caller, or as the launcher's
          * PMIX_LAUNCHER_RNDZ_URI - is the caller's word for the server,
@@ -1643,7 +1681,9 @@ complete:
 
 cleanup:
     /* an identity we were told to expect was for this connect alone, as
-     * was its bound */
+     * was its bound, and the server's other addresses */
+    free(pmix_ptl_base.connect_alt_uris);
+    pmix_ptl_base.connect_alt_uris = NULL;
     pmix_ptl_base.server_expect_given = false;
     pmix_ptl_base.connect_wait = 0;
     pmix_ptl_base.server_named = false;

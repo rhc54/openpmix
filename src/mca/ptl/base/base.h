@@ -141,6 +141,10 @@ struct pmix_ptl_base_t {
      * when the server will not take us at that address */
     char *source_file;
     char *source_uri;
+    /* the server's other TCP addresses, comma-delimited, tried in turn if
+     * the one connected to cannot be reached - from its file's alturis:
+     * line or a PMIX_SERVER_ALT_URIS directive. For one connect */
+    char *connect_alt_uris;
     /* A server found through a rendezvous file we searched for, or at a
      * fixed name, is the file's: the kernel must report it running as the
      * file's owner (rndz_owner), and - for a file by pid - as that process
@@ -243,6 +247,19 @@ struct pmix_ptl_base_t {
     bool legacy_servers_param;
     bool legacy_peers_param;
     bool legacy_clients;
+    /* tools on other hosts: whether a server takes them, as the
+     * ptl_base_remote_tools parameter asks, and as it settled it at
+     * setup_listener, where PMIX_SERVER_REMOTE_CONNECTIONS can change it.
+     * Only a PMIx built with --enable-remote-tools can - see "Between
+     * hosts" below */
+    bool remote_tools_param;
+    bool remote_tools;
+    /* the TCP listeners beyond the primary one, and where they are: when
+     * remote tools are taken, one on each other public interface the
+     * directives selected - a comma-delimited list of
+     * "tcp4://host:port"/"tcp6://host:port" */
+    pmix_list_t alt_listeners;
+    char *alt_uris;
     bool system_tool;
     bool allow_foreign_tools;
     /* the user the host named to PMIx_server_init (PMIX_USERID), and
@@ -327,6 +344,12 @@ PMIX_EXPORT extern pmix_ptl_base_t pmix_ptl_base;
  * connects to. The first line keeps the address older readers take */
 #define PMIX_PTL_LOCAL_URI_TAG "local:"
 
+/* Tags the line of the same files that carries the server's other TCP
+ * addresses, comma-delimited, when it takes tools on other hosts and has
+ * more than one public interface - see pmix_ptl_base.alt_uris. A reader
+ * finds it by this tag rather than by where it falls */
+#define PMIX_PTL_ALT_URIS_TAG "alturis:"
+
 /* The variable a server puts the same URI in for the processes it starts,
  * followed by ";<uid>:<gid>" - the identity the kernel must report for the
  * server at the far end. No released reader builds or reads this name */
@@ -352,8 +375,11 @@ PMIX_EXPORT pmix_status_t pmix_ptl_base_use_local_env(const char *server, char *
  * above. A server that may not be talked to is reported, and
  * PMIX_ERR_INVALID_CRED returned.
  *
- * Only a server on this host is talked to: one over TCP at an address
- * that is not this host's is reported, and PMIX_ERR_UNREACH returned.
+ * It checks only a server reached as one on this host: a server on
+ * another host proves who it is in the exchange between hosts instead
+ * (see "Between hosts" below), and is never asked about here. One over
+ * TCP whose far end turns out not to be at an address of this host is
+ * reported, and PMIX_ERR_UNREACH returned.
  *
  * The kernel's answer is used whenever it names a real user. It cannot
  * when there is no table of TCP connections to ask, or one that cannot be
@@ -413,6 +439,57 @@ PMIX_EXPORT bool pmix_ptl_base_named_file_vouches(const char *filename, const st
  * PMIX_ERR_UNREACH returned: it is not dialled */
 PMIX_EXPORT pmix_status_t pmix_ptl_base_server_on_host(const struct sockaddr_storage *addr,
                                                        const pmix_ptl_module_t *transport);
+
+/****    BETWEEN HOSTS    ****
+ *
+ * A tool, launcher, scheduler or server of this release connects to a
+ * server on another host over TCP, in a PMIx built with
+ * --enable-remote-tools, and the two prove who they are to each other,
+ * the server first, with credentials made for that one connection - see
+ * "Between hosts" in ptl_base_handshake.h for the exchange. A client
+ * never does: its server is on its own host. */
+
+/* How a connect reaches the server at `addr`: on this host - the local
+ * transport, or a TCP address of this host (*remote false) - or, as a
+ * tool or server in a build with remote tools, on another host (*remote
+ * true). Anything else is reported and refused: PMIX_ERR_UNREACH for an
+ * address of another host, PMIX_ERR_NOT_SUPPORTED for a TCP address of
+ * this host in a build without legacy servers, which only such a server
+ * is reached at. `uri` is for the message */
+PMIX_EXPORT pmix_status_t pmix_ptl_base_server_route(const struct sockaddr_storage *addr,
+                                                     const pmix_ptl_module_t *transport,
+                                                     const char *uri, bool *remote);
+
+/* Whether a TCP address is this host's, for a process deciding whether
+ * to talk to a server there: one on the interface list, or one an
+ * interface holds by the kernel's own list. Never, with
+ * pmix_ptl_base_test_remote set */
+PMIX_EXPORT bool pmix_ptl_base_local_addr(const struct sockaddr_storage *addr);
+
+/* Whether a URI names a TCP address that is not this host's, where this
+ * process may connect to it as one on another host (see
+ * pmix_ptl_base_server_route). False for one that does not parse */
+PMIX_EXPORT bool pmix_ptl_base_uri_is_remote(const char *uri);
+
+/* The bytes a credential made for one connection between hosts is bound
+ * to: whose it is (`server`), the tool's nonce and the server's, and the
+ * server's choice for the connection as it went on the wire. Caller frees
+ * bind->bytes */
+PMIX_EXPORT pmix_status_t pmix_ptl_base_auth_bind(bool server, const unsigned char *tool,
+                                                  const unsigned char *srv, const char *choice,
+                                                  size_t choicelen, pmix_byte_object_t *bind);
+
+/* Whether a server on another host, whose credential proves it is uid and
+ * gid, is one this process may talk to: the identity it was given for the
+ * server, if it was (`given`, `uid`, `gid`), else our own user, root, or
+ * one ptl_base_server_access allows. Reported, and PMIX_ERR_INVALID_CRED
+ * returned, if not */
+PMIX_EXPORT pmix_status_t pmix_ptl_base_remote_server_ok(uid_t kuid, gid_t kgid, bool given,
+                                                         uid_t uid, gid_t gid);
+
+/* For the unit tests alone: treat every TCP address as another host's,
+ * on both ends. Nothing outside a test's own code sets it */
+PMIX_EXPORT extern bool pmix_ptl_base_test_remote;
 
 /* Resolve the ptl_base_server_access value - "users=a:b,groups=c:d",
  * names or numbers - into pmix_ptl_base's lists. Reports and refuses an
@@ -519,6 +596,7 @@ typedef struct {
     char *uri;
     char *version;
     char *local_uri; // the server's local transport's address, if its file listed one
+    char *alt_uris;  // the server's other TCP addresses, if its file listed them
     char *bfrops;    // the server's wire formats, if its file listed them
     char *psec;      // the server's security mechanisms, if its file listed them
     bool vouched;    // its file says it may be connected to unnamed - see pmix_ptl_base_check_server

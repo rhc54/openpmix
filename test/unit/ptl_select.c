@@ -58,7 +58,7 @@ static int check_state(void)
     bool tcp = false, usock = false;
 
     PMIX_LIST_FOREACH (active, &pmix_ptl_base.actives, pmix_ptl_base_active_t) {
-#if PMIX_ENABLE_LEGACY_SUPPORT
+#if PMIX_ENABLE_TCP_TRANSPORT
         if (&pmix_ptl_tcp_module == active->module) {
             tcp = true;
             continue;
@@ -68,8 +68,9 @@ static int check_state(void)
             usock = true;
         }
     }
-    /* tcp is built only to carry peers of earlier releases */
-    if (PMIX_ENABLE_LEGACY_SUPPORT != tcp || !usock) {
+    /* tcp is built only to carry peers of earlier releases and tools on
+     * other hosts */
+    if (PMIX_ENABLE_TCP_TRANSPORT != tcp || !usock) {
         fprintf(stderr, "  in use: tcp %s, usock %s\n", tcp ? "yes" : "no",
                 usock ? "yes" : "no");
         return CHILD_FAIL;

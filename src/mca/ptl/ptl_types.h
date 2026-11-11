@@ -344,6 +344,10 @@ typedef struct {
     size_t ngids;
 } pmix_kernel_groups_t;
 
+/* the length of each nonce a credential between hosts is bound to - see
+ * "Between hosts" in base/ptl_base_handshake.h */
+#define PMIX_PTL_AUTH_NONCE_LEN 16
+
 /* connection support */
 typedef struct {
     /* on pmix_ptl_base.pending_connections while its connect-ack is
@@ -371,6 +375,16 @@ typedef struct {
     /* a local-socket connection whose offer has been answered: the
      * message arriving now is its credential */
     bool offered;
+    /* ...or a TCP connection from a tool or server on another host whose
+     * opening has been answered, with the two nonces both credentials are
+     * bound to and the uid the opening claims, which is only whom the
+     * server's credential is made for - see "Between hosts" in
+     * base/ptl_base_handshake.h. Its uid and gid are what its credential
+     * proves, and nothing before */
+    bool remote;
+    uid_t remote_uid;
+    unsigned char auth_tool[PMIX_PTL_AUTH_NONCE_LEN];
+    unsigned char auth_srv[PMIX_PTL_AUTH_NONCE_LEN];
     bool need_id;
     /* the host names the tool, but the tool reads no name back */
     bool id_unsent;

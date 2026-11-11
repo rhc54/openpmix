@@ -86,6 +86,7 @@ pmix_ptl_base_t pmix_ptl_base = {
     .uri = NULL,
     .source_file = NULL,
     .source_uri = NULL,
+    .connect_alt_uris = NULL,
     .rndz_owner_given = false,
     .rndz_owner = (uid_t) -1,
     .rndz_pid = 0,
@@ -120,6 +121,9 @@ pmix_ptl_base_t pmix_ptl_base = {
     .legacy_servers_param = false,
     .legacy_peers_param = false,
     .legacy_clients = false,
+    .remote_tools_param = false,
+    .remote_tools = false,
+    .alt_uris = NULL,
     .system_tool = false,
     .allow_foreign_tools = false,
     .host_uid_given = false,
@@ -372,6 +376,16 @@ static int pmix_ptl_register(pmix_mca_base_register_flag_t flags)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &pmix_ptl_base.legacy_peers_param);
 
+    (void) pmix_mca_base_var_register("pmix", "ptl", "base", "remote_tools",
+                                      "Whether a server takes connections from tools and servers "
+                                      "of this release on other hosts, over TCP on its public "
+                                      "interfaces, authenticated with munge or ssl. Clients are "
+                                      "never taken that way. Only a PMIx built with "
+                                      "--enable-remote-tools can; the "
+                                      "PMIX_SERVER_REMOTE_CONNECTIONS attribute overrides it",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &pmix_ptl_base.remote_tools_param);
+
     pmix_ptl_base.tmpdir_check = "refuse";
     (void) pmix_mca_base_var_register("pmix", "ptl", "base", "tmpdir_check",
                                       "What a server does when another user could change its "
@@ -540,6 +554,7 @@ static pmix_status_t pmix_ptl_close(void)
      * tool support - would silently apply to a server that never asked
      * for it. Put back the defaults from the initializer. */
     pmix_ptl_base.legacy_clients = false;
+    pmix_ptl_base.remote_tools = false;
     pmix_ptl_base.system_tool = false;
     pmix_ptl_base.allow_foreign_tools = false;
     pmix_ptl_base.host_uid_given = false;
@@ -576,6 +591,8 @@ static pmix_status_t pmix_ptl_close(void)
     PMIX_LIST_DESTRUCT(&pmix_ptl_base.posted_recvs);
     PMIX_DESTRUCT(&pmix_ptl_base.listener);
     PMIX_DESTRUCT(&pmix_ptl_base.local_listener);
+    /* stop_listening released every alternate and their list */
+    PMIX_LIST_DESTRUCT(&pmix_ptl_base.alt_listeners);
     /* stop_listening above has already closed and released anything
      * that was still on it, and on the tool queue */
     PMIX_DESTRUCT(&pmix_ptl_base.pending_connections);
@@ -644,6 +661,8 @@ static pmix_status_t pmix_ptl_close(void)
     pmix_ptl_base.source_file = NULL;
     free(pmix_ptl_base.source_uri);
     pmix_ptl_base.source_uri = NULL;
+    free(pmix_ptl_base.connect_alt_uris);
+    pmix_ptl_base.connect_alt_uris = NULL;
     if (NULL != pmix_ptl_base.urifile) {
         /* the report file we wrote, from the directory we wrote it in,
          * and only while it is still that file */
@@ -725,6 +744,7 @@ static void open_cleanup(void)
     PMIX_LIST_DESTRUCT(&pmix_ptl_base.posted_recvs);
     PMIX_DESTRUCT(&pmix_ptl_base.listener);
     PMIX_DESTRUCT(&pmix_ptl_base.local_listener);
+    PMIX_LIST_DESTRUCT(&pmix_ptl_base.alt_listeners);
     PMIX_DESTRUCT(&pmix_ptl_base.pending_connections);
     PMIX_DESTRUCT(&pmix_ptl_base.tool_queue);
     PMIX_DESTRUCT(&pmix_ptl_base.tool_asking);
@@ -747,6 +767,8 @@ static pmix_status_t pmix_ptl_open(pmix_mca_base_open_flag_t flags)
     PMIX_CONSTRUCT(&pmix_ptl_base.posted_recvs, pmix_list_t);
     PMIX_CONSTRUCT(&pmix_ptl_base.listener, pmix_listener_t);
     PMIX_CONSTRUCT(&pmix_ptl_base.local_listener, pmix_listener_t);
+    PMIX_CONSTRUCT(&pmix_ptl_base.alt_listeners, pmix_list_t);
+    pmix_ptl_base.alt_uris = NULL;
     PMIX_CONSTRUCT(&pmix_ptl_base.pending_connections, pmix_list_t);
     PMIX_CONSTRUCT(&pmix_ptl_base.tool_queue, pmix_list_t);
     PMIX_CONSTRUCT(&pmix_ptl_base.tool_asking, pmix_list_t);
@@ -947,6 +969,10 @@ static void pccon(pmix_pending_connection_t *p)
     p->msg_recvd = 0;
     p->msg_size = 0;
     p->offered = false;
+    p->remote = false;
+    p->remote_uid = (uid_t) -1;
+    memset(p->auth_tool, 0, sizeof(p->auth_tool));
+    memset(p->auth_srv, 0, sizeof(p->auth_srv));
     p->status = PMIX_SUCCESS;
     p->flag = PMIX_SIMPLE_CLIENT;
     p->buffer_type = PMIX_BFROP_BUFFER_UNDEF;
@@ -1137,6 +1163,7 @@ static void ccon(pmix_connection_t *p)
     p->uri = NULL;
     p->version = NULL;
     p->local_uri = NULL;
+    p->alt_uris = NULL;
     p->bfrops = NULL;
     p->psec = NULL;
     p->vouched = false;
@@ -1155,6 +1182,7 @@ static void dcon(pmix_connection_t *p)
         free(p->version);
     }
     free(p->local_uri);
+    free(p->alt_uris);
     free(p->bfrops);
     free(p->psec);
 }

@@ -88,10 +88,11 @@ transports. `pmix_ptl_base_select` keeps every one whose query succeeds on
 `pmix_ptl_base.actives`, highest priority first. There are two:
 [`usock/`](usock/AGENTS.md), the local socket every process of this
 release uses, always built; and [`tcp/`](tcp/AGENTS.md), which carries
-every connection with a peer of an earlier release and is built only
-when either direction of legacy support is (`--enable-legacy-clients`,
-or `--enable-legacy-servers`, both off by default;
-`PMIX_ENABLE_LEGACY_SUPPORT`). Nothing outside `tcp/` may name a tcp
+every connection with a peer of an earlier release or a peer on another
+host, and is built only when either direction of legacy support is
+(`--enable-legacy-clients`, or `--enable-legacy-servers`), or remote
+tools are (`--enable-remote-tools`) - all off by default;
+`PMIX_ENABLE_TCP_TRANSPORT`. Nothing outside `tcp/` may name a tcp
 symbol unless it is under that macro.
 
 A transport (`pmix_ptl_module_t` in [`ptl.h`](ptl.h)) does only what
@@ -394,13 +395,19 @@ Both connect through **`pmix_ptl_base_make_connection`** when blocking,
 and **`pmix_ptl_base_start_connection`** (`ptl_base_fns.c`, the `cnct_*`
 state machine) when event-driven; the blocking steps are:
 `setup_connection` (parse the `tcp4://host:port` URI into a
-`sockaddr_storage`) → `pmix_ptl_base_server_on_host` (a TCP address that
-is not this host's is not dialled: `PMIX_ERR_UNREACH`) →
-`pmix_ptl_base_connect` (open the socket, retrying) →
+`sockaddr_storage`) → `pmix_ptl_base_server_route` (a TCP address that
+is not this host's is dialled only by a tool or server in a build with
+remote tools; otherwise `PMIX_ERR_UNREACH`) →
+`pmix_ptl_base_connect` (open the socket, retrying - and, for a server on
+another host, its alternate addresses) →
 `pmix_ptl_base_check_server` (the far end must be a server we may talk
 to, by what the kernel says of it; with no TCP table, one something
-vouches for - see `base/AGENTS.md`) → on the local socket `local_handshake`
-(offer, the server's choice, credential), over TCP `send_connect_ack`
+vouches for - see `base/AGENTS.md`; not for a server on another host,
+which proves who it is in the exchange) → on the local socket
+`local_handshake` (offer, the server's choice, credential), to another
+host `remote_handshake` (the same, with the server's proof after its
+choice and a credential bound to the connection), over TCP on this host
+`send_connect_ack`
 (`construct_message` builds the handshake blob) →
 `recv_connect_ack` (run the client or tool handshake) → assign the lower
 half of the dynamic-tag space. Then `pmix_ptl_base_complete_connection`
@@ -481,15 +488,19 @@ transport open the socket (`pmix_ptl_base_listen`), and publishes what
 the transport made. The local transport's listener is always made; the
 tcp transport's only when the server takes legacy clients
 (`pmix_ptl_base.legacy_clients`, from `ptl_base_legacy_clients` or
-`ptl_base_legacy_peers`, then `PMIX_SERVER_LEGACY_PEERS`). The tcp transport's part is the first two
-steps:
+`ptl_base_legacy_peers`, then `PMIX_SERVER_LEGACY_PEERS`) or remote
+tools (`pmix_ptl_base.remote_tools`, from `ptl_base_remote_tools`, then
+`PMIX_SERVER_REMOTE_CONNECTIONS`). The tcp transport's part is the first
+two steps:
 
 - **Interface selection.** Enumerate interfaces, filter through
-  `if_include`/`if_exclude`, and take a **loopback** device. It never
-  falls back to a public interface: directives that leave no loopback
-  device fail the init (`no-loopback-interfaces`), and a host that asks
-  for connections from other hosts (`PMIX_SERVER_REMOTE_CONNECTIONS`
-  true) fails it too (`remote-connections-not-supported`).
+  `if_include`/`if_exclude`, and take a **loopback** device - or, when
+  remote tools are taken, the first public one, with a listener on each
+  other public one too (`pmix_ptl_base.alt_listeners`). It never falls
+  back from one kind to the other: directives that leave none of the
+  kind needed fail the init (`no-loopback-interfaces`,
+  `no-remote-interfaces`), and remote tools asked for in a build without
+  them fail it too (`remote-tools-not-built`).
 - **Bind.** Try each port from `ipv4_ports` / `ipv6_ports` (default `0` =
   let the kernel choose), set `SO_REUSEADDR` and close-on-exec, `listen`
   with `SOMAXCONN`, and make the socket non-blocking.

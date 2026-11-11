@@ -166,10 +166,22 @@ should. The sections after this one give the full tables.
        ``tcp+`` and legacy clients are off
      - the server fails to initialize: it has no TCP address to report.
      - Turn legacy clients on, or report ``-`` or ``+``.
-   * - The host passes ``PMIX_SERVER_REMOTE_CONNECTIONS`` set true
-     - the server fails to initialize. A server takes connections from
-       its own host only.
-     - Remove the attribute.
+   * - The host passes ``PMIX_SERVER_REMOTE_CONNECTIONS`` set true (or
+       the site sets ``ptl_base_remote_tools``) in a PMIx not configured
+       ``--enable-remote-tools`` (the default)
+     - the server fails to initialize.
+     - Configure ``--enable-remote-tools``, or remove the setting.
+   * - Remote tools are asked for, and neither ``munge`` (with a running
+       ``munged``) nor ``ssl`` (with a certificate, key and CA) is
+       available to the server
+     - the server fails to initialize: ``native`` cannot authenticate a
+       process on another node.
+     - Configure ``--with-munge`` or ``--with-openssl``, and give the
+       mechanism what it needs.
+   * - A client is pointed at a server on another node
+     - its ``PMIx_Init`` fails. Only tools, launchers, schedulers and
+       servers connect to a server on another node.
+     - Run the client under the server on its own node.
    * - PMIx is configured *without* ``--enable-legacy-servers`` (the
        default) and an application runs under a resource manager of a
        release before v7.0 - a container brought to an older system,
@@ -277,8 +289,52 @@ A client or tool reaching a server of an earlier release
        directory, where earlier releases write their rendezvous files.
 
 With neither ``--enable-legacy-clients`` nor ``--enable-legacy-servers``
-- the default - the library has no TCP transport, and no wire format
-but this release's.
+- the default - the library has no wire format but this release's, and
+no TCP transport unless ``--enable-remote-tools`` was given.
+
+
+.. _label-settings-matrix-remote:
+
+Tools on other nodes
+--------------------
+
+A tool, launcher or scheduler of this release on one node - or a server
+reaching a scheduler - connecting to a server on another. See
+:ref:`label-conn-between-hosts`.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 30 45
+
+   * - Built with
+     - At run time
+     - The server
+   * - default (no ``--enable-remote-tools``)
+     - nothing set
+     - Takes connections from its own node only. A tool does not dial a
+       server at an address that is not its node's.
+   * - default
+     - ``ptl_base_remote_tools`` or ``PMIX_SERVER_REMOTE_CONNECTIONS``
+       true
+     - **Fails to initialize.**
+   * - ``--enable-remote-tools`` (with ``--with-munge`` or
+       ``--with-openssl``)
+     - nothing set; or the host passes
+       ``PMIX_SERVER_REMOTE_CONNECTIONS`` false
+     - As in the first row.
+   * - ``--enable-remote-tools``
+     - ``ptl_base_remote_tools`` true and no attribute, or the host
+       passes ``PMIX_SERVER_REMOTE_CONNECTIONS`` true
+     - Listens on TCP on its public interfaces, besides its local socket.
+       Takes a tool, launcher, scheduler or server of this release on
+       another node that proves who it is with ``munge`` or ``ssl``,
+       after proving who it is itself; refuses a client and any process
+       of an earlier release that way. Fails to initialize when neither
+       mechanism can, or no public interface is left.
+
+The server must take tools as well (``PMIX_SERVER_TOOL_SUPPORT``; a
+scheduler and a system controller do unless told not to), and a tool of
+another user needs ``PMIX_SERVER_ALLOW_FOREIGN_TOOLS``, as on one node.
 
 
 .. _label-settings-matrix-tools:

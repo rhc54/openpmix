@@ -34,6 +34,7 @@ nothing more.
 | [`ptl_base_listener.c`](ptl_base_listener.c) | having a transport open the listener, URI publication, rendezvous files, the accept handler |
 | [`ptl_base_rndz.c`](ptl_base_rndz.c) | where rendezvous files go and are looked for: the `pmix-user.<uid>` directory, `$XDG_RUNTIME_DIR/pmix` in its place, `/run/pmix`, the readers' directory list, and whether the legacy walk runs |
 | [`ptl_base_connection_hdlr.c`](ptl_base_connection_hdlr.c) | the **inbound** half: parse a connect-ack, build a peer, tell the host |
+| [`ptl_base_auth.c`](ptl_base_auth.c) | between hosts: which way a connect goes (`pmix_ptl_base_server_route`), the bytes both bound credentials carry, and whether a server that proved who it is may be talked to |
 | [`ptl_base_connect.c`](ptl_base_connect.c) | the **outbound** half: blocking socket helpers, `connect()`, the tool discovery matrix |
 | [`ptl_base_fns.c`](ptl_base_fns.c) | string/URI parsing, connect-ack construction, the client and tool handshakes, server discovery |
 | [`ptl_base_token.c`](ptl_base_token.c) | the connection token `register_client` and `setup_fork` give a rank: make, check, forget, and add to a connect-ack |
@@ -148,10 +149,9 @@ drives the pair directly and will catch the drift.
 
 **A server accepts peers from v2.1 on; a client or tool connects only to
 a server from v3.2 on.** Both are enforced here, by version, before
-anything is read that depends on it. **Neither end takes a peer on
-another host**: a process does not dial a server at an address that is
-not its host's (`pmix_ptl_base_server_on_host`), and a server refuses a
-TCP peer at one.
+anything is read that depends on it. A peer on another host is taken
+only by the exchange between hosts, and only in a build with remote
+tools - see "This host, and between hosts" below.
 
 - The connection handler refuses a peer whose version string says v1.x
   or v2.0 (`unsupported-client-version`), and sends it `PMIX_ERR_OUTDATED`
@@ -1274,34 +1274,87 @@ to one valid file and drives both walks under a watchdog.
   back onto the same `pmix_rank_t`. A digits-only parse would refuse
   those servers, which are inside the interoperability floor.
 
-## Only this host
+## This host, and between hosts
 
-A server takes connections from its own host only, and a process
-connects only to a server on its own host. There is no exchange for a
-peer on another host, and none of the remote-tool machinery (an
-authentication file, a connector flag for it, bound credentials,
-alternate listeners) exists any more.
+A server takes connections from its own host, and - in a PMIx built with
+`--enable-remote-tools` (`PMIX_ENABLE_REMOTE_TOOLS`), when asked - from
+tools, launchers, schedulers and servers of this release on other hosts.
+A client connects only to a server on its own host. The exchange between
+hosts is specified in [`ptl_base_handshake.h`](ptl_base_handshake.h)
+under "Between hosts"; its shared pieces are in
+[`ptl_base_auth.c`](ptl_base_auth.c).
 
-- **The server** refuses a TCP peer whose address
-  `pmix_ptl_base_addr_on_host` does not claim, in `validate()`, with
-  `PMIX_ERR_NO_PERMISSIONS`, before the security module is asked. A
-  connection on the local transport is always on this host. A host that
-  sets `PMIX_SERVER_REMOTE_CONNECTIONS` true fails
-  `pmix_ptl_base_setup_listener` (`remote-connections-not-supported`);
-  false is accepted and changes nothing. The attribute is in
-  `pmix_deprecated.h`: it has been in a release, so it stays defined.
-- **The process** does not dial a TCP address that is not this host's
-  by `local_addr()` (`pmix_ptl_base_server_on_host`, `PMIX_ERR_UNREACH`),
-  and `check_server` refuses one it finds itself connected to anyway.
+- **Asking for it.** `pmix_ptl_base.remote_tools` is settled at
+  `setup_listener` from `ptl_base_remote_tools` (`remote_tools_param`),
+  then `PMIX_SERVER_REMOTE_CONNECTIONS`. Either in a build without remote
+  tools fails the init (`remote-tools-not-built`), and so does a server
+  with no mechanism that makes a credential for one connection
+  (`pmix_psec_base_remote_available()`, `remote-no-psec`): munge, or ssl
+  with a certificate, key and CA. `false` is accepted and changes
+  nothing. `pmix_ptl_close` resets it.
+- **The listener** is then on the first public interface the
+  `if_include`/`if_exclude` directives leave, not on loopback
+  (`no-remote-interfaces` when there is none), with one more on each
+  other public interface (`open_alternate()` in `../tcp/ptl_tcp.c`) in
+  `pmix_ptl_base.alt_listeners`. Their addresses, comma-delimited, are
+  `pmix_ptl_base.alt_uris`: stored as `PMIX_MYSERVER_ALT_URIS`, written on
+  an `alturis:` line (`PMIX_PTL_ALT_URIS_TAG`) in the rendezvous and
+  report files, after the lines a released reader takes by position. The
+  primary URI never carries more than one address. Peers of earlier
+  releases on this host reach the public address, which is the host's.
+  `start_listening` arms the alternates and `stop_listening` releases
+  them.
+- **The server** recognizes the opening by the first fields of a TCP
+  connect-ack: an empty credential and `PMIX_REMOTE_TOOL` where the
+  connector kind goes (`remote_opening()`), whatever address it comes
+  from - a port forward makes a tool on another host look like one on
+  loopback, and nothing about the exchange depends on the address.
+  `answer_remote()` parses the offer with the local socket's
+  `parse_offer()`, refuses any kind but `PMIX_TOOL_NEEDS_ID`,
+  `PMIX_TOOL_GIVEN_ID`, `PMIX_LAUNCHER_NEEDS_ID`,
+  `PMIX_LAUNCHER_GIVEN_ID` and `PMIX_SCHEDULER_WITH_ID` - a client, a
+  singleton, a tool-client or launcher-client names a rank whose
+  registration the kernel's identity is checked against - and refuses
+  everything when `remote_tools` is off. `choose()` takes only a
+  mechanism that is `pmix_psec_base_remote_capable()`, only the
+  `PMIX_PTL_REMOTE_GDS` datastore, and no namespace wire format: the
+  peer has proved nothing yet. The connection is marked `remote` and
+  `offered`, and its uid and gid are -1 until `validate_remote()` checks
+  its credential as a tool's, bound to the two nonces and the choice
+  (`choice_text()`, the same bytes `send_choice` sends), and requires the
+  uid it proves to be the one its opening named. Nothing else in the
+  tool path changes: `tool_settled` takes the identity, and the foreign
+  tool rule, the queue and the host's up-call follow as for any tool.
+  The address check in `validate()` does not apply to it.
+- **The process.** After `uri_to_addr`, both connects call
+  `pmix_ptl_base_server_route()`: the local transport is this host; a TCP
+  address `pmix_ptl_base_local_addr()` calls this host's is this host -
+  refused `legacy-servers-tcp` in a build without legacy servers; any
+  other is another host's, taken as `remote` by a tool, launcher,
+  scheduler or server in a build with remote tools (`remote-not-tool`
+  for a client), else `server-not-local`. A remote connect skips
+  `check_server` - the kernel names nobody on another host - tries the
+  alternates (`pmix_ptl_base.connect_alt_uris`, from the file's
+  `alturis:` line through `take_address()` or a `PMIX_SERVER_ALT_URIS`
+  directive, reset by every connect) when its address does not answer
+  (`connect_alts()`, or `cnct_retry()` for the event-driven connect), and
+  runs `remote_handshake()` - or the `PMIX_CNCT_PROOF_*` states. The
+  server's proof is checked by `check_proof()`: `validate_bound` as a
+  server's, then `pmix_ptl_base_remote_server_ok()` - the identity a
+  server that started us named, else our own user, root, or one
+  `ptl_base_server_access` allows. A bare TCP URI is refused
+  (`tcp-uri-alone`) unless `pmix_ptl_base_uri_is_remote()`.
 - **Which hosts are this host.** The server asks
   `pmix_ptl_base_addr_on_host`: a loopback address, or one on the
   interface list (an IPv4 peer arriving v4-mapped is unwrapped first). A
   link-local IPv6 address is ours only with the scope id of the
   interface that holds it. The process asks `local_addr()`, which also
-  takes an address the kernel's own list says an interface holds. A TCP address that
-  leads elsewhere through this host - a port forward, a proxy - reaches
-  a server that sees its peer at an address not its host's, and is
-  refused there.
+  takes an address the kernel's own list says an interface holds. A TCP
+  peer of an earlier release whose address is not its host's is refused
+  in `validate()` with `PMIX_ERR_NO_PERMISSIONS`.
+- **`pmix_ptl_base_test_remote`** has `pmix_ptl_base_local_addr()` call
+  every TCP address another host's, so `test/unit/ptl_remote_auth.c` can
+  run both ends on one host. Nothing outside a test sets it.
 
 ## A process that execs loses its connection
 
